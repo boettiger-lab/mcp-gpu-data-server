@@ -2,9 +2,19 @@
 GPU-accelerated query engine — executes SQL via Polars SQLContext with
 optional GPU acceleration (RAPIDS cuDF backend).
 
-Replaces the DuckDB isolation engine from the original mcp-data-server.
-Each query is stateless: a fresh SQLContext is created, parquet sources
-are registered as LazyFrames, and the query is executed.
+Two I/O backends are available (set QUERY_ENGINE env var):
+
+  QUERY_ENGINE=gpu        (default) Polars lazy reader + cuDF GPU compute
+  QUERY_ENGINE=gpu-cudf   cuDF eager reader (GPU decompression + kvikio
+                          RDMA when available) + cuDF GPU compute
+  QUERY_ENGINE=cpu        Polars CPU reader + CPU compute (no GPU)
+
+The gpu-cudf mode uses cudf.read_parquet which:
+  - Decompresses parquet on GPU (faster than CPU for snappy/zstd)
+  - Uses kvikio GDS/RDMA when installed and the hardware supports it
+    (e.g. 100G InfiniBand on NRP Nautilus nodes)
+  - Materialises each source table eagerly — do not use for datasets
+    larger than GPU VRAM.
 """
 
 import os
@@ -13,7 +23,7 @@ import polars as pl
 from sql_rewriter import rewrite_sql
 
 # ---------------------------------------------------------------------------
-# GPU engine availability
+# GPU compute engine availability
 # ---------------------------------------------------------------------------
 try:
     from polars import GPUEngine
@@ -23,6 +33,25 @@ try:
 except ImportError:
     _GPU_AVAILABLE = False
     print("GPU engine not available — using CPU fallback", file=sys.stderr)
+
+# ---------------------------------------------------------------------------
+# KvikIO availability (GPU-direct I/O)
+# ---------------------------------------------------------------------------
+try:
+    import kvikio
+    import kvikio.defaults
+    _KVIKIO_AVAILABLE = True
+    # Prefer GDS/RDMA; fall back to compat (CPU-assisted) mode automatically
+    kvikio.defaults.num_threads(16)  # parallel I/O threads
+    _gds = kvikio.is_remote_file_supported()
+    print(
+        f"kvikio available — GDS/RDMA supported: {_gds}  "
+        f"(compat mode: {kvikio.defaults.compat_mode()})",
+        file=sys.stderr,
+    )
+except ImportError:
+    _KVIKIO_AVAILABLE = False
+    print("kvikio not available — GPU-direct I/O disabled", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # S3 storage configuration (internal Ceph endpoint on NRP Nautilus)
@@ -47,12 +76,31 @@ else:
     # HMAC-signed requests that Ceph rejects with 400 InvalidArgument.
     S3_STORAGE_OPTIONS["skip_signature"] = "true"
 
-# Whether to prefer GPU execution (can be overridden by env var)
-PREFER_GPU = os.environ.get("QUERY_ENGINE", "gpu").lower() != "cpu"
+# ---------------------------------------------------------------------------
+# Engine mode selection
+# ---------------------------------------------------------------------------
+_ENGINE_MODE = os.environ.get("QUERY_ENGINE", "gpu").lower()
+
+# Use cuDF I/O path when explicitly requested or when kvikio is available
+# and the engine is set to gpu-cudf.
+PREFER_GPU = _ENGINE_MODE != "cpu"
+USE_CUDF_IO = _ENGINE_MODE == "gpu-cudf" and _GPU_AVAILABLE
+
+print(
+    f"Query engine: {_ENGINE_MODE}  "
+    f"(GPU compute: {PREFER_GPU and _GPU_AVAILABLE}, "
+    f"cuDF I/O: {USE_CUDF_IO}, "
+    f"kvikio: {_KVIKIO_AVAILABLE})",
+    file=sys.stderr,
+)
 
 # Result row limit (same as original DuckDB server)
 RESULT_LIMIT = 50
 
+
+# ---------------------------------------------------------------------------
+# Collect / execute
+# ---------------------------------------------------------------------------
 
 def _collect(lf: pl.LazyFrame, use_gpu: bool = True) -> pl.DataFrame:
     """Collect a LazyFrame, with GPU→CPU fallback."""
@@ -69,11 +117,9 @@ def _format_markdown(df: pl.DataFrame) -> str:
     if df.is_empty():
         return "No results found."
 
-    # Limit rows
     if len(df) > RESULT_LIMIT:
         df = df.head(RESULT_LIMIT)
 
-    # Build markdown table directly from Polars (no pandas/pyarrow needed)
     headers = df.columns
     header_line = "| " + " | ".join(headers) + " |"
     separator = "| " + " | ".join("---" for _ in headers) + " |"
@@ -88,17 +134,17 @@ def _handle_copy(df: pl.DataFrame, dest_path: str, format_opts: str | None) -> s
     try:
         import s3fs
 
-        # Parse the destination — convert s3:// to the internal endpoint
         s3 = s3fs.S3FileSystem(
             endpoint_url=S3_STORAGE_OPTIONS["endpoint_url"],
-            key=S3_STORAGE_OPTIONS["aws_access_key_id"] or None,
-            secret=S3_STORAGE_OPTIONS["aws_secret_access_key"] or None,
+            key=S3_STORAGE_OPTIONS.get("aws_access_key_id") or None,
+            secret=S3_STORAGE_OPTIONS.get("aws_secret_access_key") or None,
+            anon=S3_STORAGE_OPTIONS.get("skip_signature") == "true",
+            config_kwargs={"allow_http": True},
         )
 
         with s3.open(dest_path, "w") as f:
             df.write_csv(f)
 
-        # Return the public URL
         public_path = dest_path.replace("s3://", "")
         public_url = f"https://s3-west.nrp-nautilus.io/{public_path}"
         return f"File written to: {public_url}"
@@ -109,27 +155,33 @@ def _handle_copy(df: pl.DataFrame, dest_path: str, format_opts: str | None) -> s
         return f"Error writing file: {e}"
 
 
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
 def execute(sql_query: str) -> str:
     """Execute a SQL query using Polars with optional GPU acceleration.
 
-    This is the main entry point called by the MCP server's query tool.
+    I/O backend is controlled by QUERY_ENGINE env var:
+      gpu       — Polars lazy reader (default)
+      gpu-cudf  — cuDF eager reader with kvikio RDMA when available
+      cpu       — CPU-only
+
     Returns a markdown-formatted result table or error message.
     """
     try:
         rewritten_sql, ctx, copy_dest, copy_format = rewrite_sql(
-            sql_query, S3_STORAGE_OPTIONS
+            sql_query,
+            S3_STORAGE_OPTIONS,
+            use_cudf_io=USE_CUDF_IO,
         )
 
-        # Execute the query
         result_lf = ctx.execute(rewritten_sql)
 
-        # Collect results
         if copy_dest:
-            # For COPY statements, collect all rows (no limit)
             df = _collect(result_lf, use_gpu=True)
             return _handle_copy(df, copy_dest, copy_format)
         else:
-            # For regular queries, apply row limit via head()
             limited_lf = result_lf.head(RESULT_LIMIT)
             df = _collect(limited_lf, use_gpu=True)
             return _format_markdown(df)
