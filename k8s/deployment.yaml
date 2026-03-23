@@ -12,6 +12,13 @@ spec:
       labels:
         app: gpu-mcp
     spec:
+      tolerations:
+        - key: "nautilus.io/issue"
+          value: "1568"
+          operator: Equal
+          effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/hostname: stratus1.nrp-espm.berkeley.edu
       containers:
       - name: server
         image: ghcr.io/boettiger-lab/mcp-gpu-data-server:latest
