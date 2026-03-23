@@ -161,14 +161,17 @@ def fetch_stac_catalog() -> dict[str, str]:
     """Fetch the STAC catalog and return {collection_id: markdown_summary}."""
     try:
         cat = pystac.Catalog.from_file(STAC_CATALOG_URL)
-        datasets = {}
-        for child in cat.get_children():
-            datasets[child.id] = _format_collection(child)
-        print(f"📂 Loaded {len(datasets)} collections from STAC: {STAC_CATALOG_URL}", file=sys.stderr)
-        return datasets
     except Exception as e:
         print(f"⚠️ Failed to load STAC catalog: {e}", file=sys.stderr)
         return {}
+    datasets = {}
+    for child in cat.get_children():
+        try:
+            datasets[child.id] = _format_collection(child)
+        except Exception as e:
+            print(f"⚠️ Skipping collection {child.id}: {e}", file=sys.stderr)
+    print(f"📂 Loaded {len(datasets)} collections from STAC: {STAC_CATALOG_URL}", file=sys.stderr)
+    return datasets
 
 
 # Load once at startup
