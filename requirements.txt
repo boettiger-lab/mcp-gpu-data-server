@@ -1,0 +1,7 @@
+mcp
+polars
+uvicorn
+pystac
+tabulate
+h3
+s3fs

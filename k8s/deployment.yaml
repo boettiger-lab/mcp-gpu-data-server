@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gpu-mcp
+  template:
+    metadata:
+      labels:
+        app: gpu-mcp
+    spec:
+      containers:
+      - name: server
+        image: ghcr.io/boettiger-lab/mcp-gpu-data-server:latest
+        env:
+        - name: STAC_CATALOG_URL
+          value: "https://s3-west.nrp-nautilus.io/public-data/stac/catalog.json"
+        - name: QUERY_ENGINE
+          value: "gpu"
+        resources:
+          requests:
+            memory: 32Gi
+            cpu: 4
+            nvidia.com/gpu: 1
+          limits:
+            memory: 120Gi
+            cpu: 16
+            nvidia.com/gpu: 1
+        ports:
+        - containerPort: 8000
+        readinessProbe:
+          tcpSocket:
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 5
