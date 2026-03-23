@@ -19,15 +19,13 @@ _STAC_TIMEOUT = int(os.environ.get("STAC_TIMEOUT", "15"))
 
 class _TimeoutStacIO(DefaultStacIO):
     """pystac IO with a configurable request timeout (default 15s)."""
-    def stac_object_from_dict(self, *args, **kwargs):
-        return super().stac_object_from_dict(*args, **kwargs)
 
-    def read_text_method(self, source, *args, **kwargs):
-        if isinstance(source, str) and source.startswith("http"):
-            resp = requests.get(source, timeout=_STAC_TIMEOUT)
+    def read_text_from_href(self, href: str) -> str:
+        if href.startswith("http"):
+            resp = requests.get(href, timeout=_STAC_TIMEOUT)
             resp.raise_for_status()
             return resp.text
-        return super().read_text_method(source, *args, **kwargs)
+        return super().read_text_from_href(href)
 
 
 pystac.StacIO.set_default(_TimeoutStacIO)
