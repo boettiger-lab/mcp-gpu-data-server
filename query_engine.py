@@ -27,15 +27,25 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # S3 storage configuration (internal Ceph endpoint on NRP Nautilus)
 # ---------------------------------------------------------------------------
+_S3_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "")
+_S3_SECRET = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+
 S3_STORAGE_OPTIONS = {
     "endpoint_url": os.environ.get(
         "S3_ENDPOINT_URL", "http://rook-ceph-rgw-nautiluss3.rook"
     ),
-    "aws_access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", ""),
-    "aws_secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
     "aws_region": os.environ.get("AWS_REGION", "us-east-1"),
     "allow_http": "true",
 }
+
+if _S3_KEY and _S3_SECRET:
+    S3_STORAGE_OPTIONS["aws_access_key_id"] = _S3_KEY
+    S3_STORAGE_OPTIONS["aws_secret_access_key"] = _S3_SECRET
+else:
+    # No credentials configured — use unsigned (anonymous) requests.
+    # Passing empty strings causes Polars/object_store to send malformed
+    # HMAC-signed requests that Ceph rejects with 400 InvalidArgument.
+    S3_STORAGE_OPTIONS["skip_signature"] = "true"
 
 # Whether to prefer GPU execution (can be overridden by env var)
 PREFER_GPU = os.environ.get("QUERY_ENGINE", "gpu").lower() != "cpu"
