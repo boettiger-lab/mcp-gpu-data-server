@@ -16,7 +16,8 @@ from sql_rewriter import rewrite_sql
 # GPU engine availability
 # ---------------------------------------------------------------------------
 try:
-    from polars.gpu import GPUEngine
+    from polars import GPUEngine
+    import cudf_polars  # noqa: F401 — required to activate GPU backend
     _GPU_AVAILABLE = True
     print("GPU engine available (RAPIDS cuDF backend)", file=sys.stderr)
 except ImportError:

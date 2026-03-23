@@ -10,6 +10,27 @@ high-speed internal reads via the Ceph S3 endpoint.
 import os
 import sys
 import pystac
+from pystac.stac_io import DefaultStacIO
+import requests
+
+
+_STAC_TIMEOUT = int(os.environ.get("STAC_TIMEOUT", "15"))
+
+
+class _TimeoutStacIO(DefaultStacIO):
+    """pystac IO with a configurable request timeout (default 15s)."""
+    def stac_object_from_dict(self, *args, **kwargs):
+        return super().stac_object_from_dict(*args, **kwargs)
+
+    def read_text_method(self, source, *args, **kwargs):
+        if isinstance(source, str) and source.startswith("http"):
+            resp = requests.get(source, timeout=_STAC_TIMEOUT)
+            resp.raise_for_status()
+            return resp.text
+        return super().read_text_method(source, *args, **kwargs)
+
+
+pystac.StacIO.set_default(_TimeoutStacIO)
 
 
 STAC_CATALOG_URL = os.environ.get(
@@ -206,8 +227,7 @@ def fetch_stac_collections(catalog_url: str = None) -> dict[str, str]:
         return {"error": f"Failed to load STAC catalog: {e}"}
 
 
-# Load once at startup (simple format for external consumers)
-DATA_CATALOG = fetch_stac_collections()
+DATA_CATALOG = STAC_DATASETS
 
 
 def list_datasets() -> str:
