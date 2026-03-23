@@ -17,10 +17,19 @@ import requests
 _STAC_TIMEOUT = int(os.environ.get("STAC_TIMEOUT", "15"))
 
 
+_S3_PUBLIC = "https://s3-west.nrp-nautilus.io/"
+_S3_INTERNAL = os.environ.get(
+    "S3_ENDPOINT_URL", "http://rook-ceph-rgw-nautiluss3.rook"
+).rstrip("/") + "/"
+
+
 class _TimeoutStacIO(DefaultStacIO):
-    """pystac IO with a configurable request timeout (default 15s)."""
+    """pystac IO that rewrites public S3 HTTPS URLs to the internal Ceph
+    endpoint (avoiding TLS) and enforces a request timeout."""
 
     def read_text_from_href(self, href: str) -> str:
+        if href.startswith(_S3_PUBLIC):
+            href = _S3_INTERNAL + href[len(_S3_PUBLIC):]
         if href.startswith("http"):
             resp = requests.get(href, timeout=_STAC_TIMEOUT)
             resp.raise_for_status()
