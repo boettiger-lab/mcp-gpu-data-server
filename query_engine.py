@@ -43,11 +43,12 @@ try:
     import kvikio
     import kvikio.defaults
     _KVIKIO_AVAILABLE = True
-    # High-performance S3 transport: 64 threads + 16 MiB chunks saturates
-    # 100G InfiniBand and matches the NVIDIA-recommended config for ~9 Gbps.
-    # See https://developer.nvidia.com/blog/high-performance-remote-io-with-nvidia-kvikio/
-    kvikio.defaults.set_num_threads(64)
-    kvikio.defaults.set_task_size(16 * 1024 * 1024)  # 16 MiB per request
+    # NOTE: kvikio.defaults.set_num_threads() / set_task_size() are broken in 25.02
+    # — they accept the call but the value doesn't change. Use env vars instead:
+    #   KVIKIO_NTHREADS=64  KVIKIO_TASK_SIZE=16777216
+    # These must be set before library init (i.e. in the container/deployment env).
+    # Benchmark result: 64 threads + 16 MiB chunks → 6.25 Gbps on NRP 100G IB for
+    # large parquet files (78-767 MB), vs 0.97 Gbps from Polars Rust object_store.
     _remote = kvikio.is_remote_file_available()
     print(
         f"kvikio {kvikio.__version__} — threads: {kvikio.defaults.get_num_threads()}, "

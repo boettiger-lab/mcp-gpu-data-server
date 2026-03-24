@@ -14,20 +14,21 @@ Two I/O backends are supported, selected by the `use_cudf_io` flag:
     Partition pruning: automatic via Polars lazy query optimizer (DPP).
     S3 transport: Rust object_store (~10.8s for 548 files, 0.06 GiB).
 
-  cuDF (gpu-cudf mode) — experimental
-    cudf.read_parquet → GPU-accelerated parquet decompression, eager read.
-    Path: S3 → PyArrow S3FileSystem → CPU RAM → GPU decompression → VRAM
+  cuDF (gpu-cudf mode) — recommended for large-file datasets
+    Path: S3 → kvikio pread (parallel chunked HTTP) → CPU RAM → GPU decompress → VRAM
     Partition pruning: explicit h0 predicate extraction before read (issue #4).
-    NOTE: cudf.read_parquet(storage_options=...) routes through PyArrow S3,
-    NOT kvikio, despite what the RAPIDS docs imply. See issue #3.
-    S3 transport benchmark (IUCN, 548 files, 0.06 GiB, internal Ceph):
-      Polars Rust object_store:    10.8s  ← fastest
-      kvikio.RemoteFile.open_http: 33.1s  (30.1s download across 32 workers)
-      cudf.read_parquet (PyArrow): ~same as Polars (routes same path)
-    The public HTTPS endpoint (s3-west.nrp-nautilus.io) has TLS handshake
-    timeout from inside the cluster, blocking kvikio HTTPS tests (issue #3).
+    S3 transport: kvikio.RemoteFile.pread() with KVIKIO_NTHREADS=64 env var.
+    S3 transport benchmark (carbon Americas, 28 files, 3.22 GiB, internal Ceph):
+      kvikio pread (64 threads, 16 MiB chunks): 4.1s  6.25 Gbps  ← 6.5x faster
+      Polars Rust object_store:                26.6s  0.97 Gbps
+    NOTE: kvikio.defaults.set_num_threads() is broken in 25.02 — values don't
+    stick. Must use KVIKIO_NTHREADS env var set before library init. See #3.
+    NOTE: cudf.read_parquet(storage_options=...) uses PyArrow S3, NOT kvikio.
+    We use kvikio.RemoteFile.pread() → BytesIO → cudf.read_parquet() instead.
 """
 
+import concurrent.futures
+import io
 import re
 import sys
 import polars as pl
@@ -148,28 +149,48 @@ def _s3fs_from_storage_options(storage_options: dict):
     )
 
 
+def _kvikio_download_one(args: tuple) -> tuple[bytes, int]:
+    """Download a single parquet file via kvikio pread (parallel chunked HTTP).
+
+    Uses pread() rather than read() to activate kvikio's internal thread pool
+    for concurrent range requests. With KVIKIO_NTHREADS=64 and
+    KVIKIO_TASK_SIZE=16777216 this achieves ~6 Gbps on NRP 100G IB.
+
+    Returns (raw_bytes, h0_value) for hive partition column injection.
+    """
+    import kvikio
+    http_url, h0 = args
+    f = kvikio.RemoteFile.open_http(http_url)
+    n = f.nbytes()
+    buf = bytearray(n)
+    fut = f.pread(buf, size=n, file_offset=0)
+    fut.get()
+    return bytes(buf), h0
+
+
 def _scan_cudf(
     s3_path: str,
     storage_options: dict,
     h0_filter: frozenset[int] | None = None,
 ) -> pl.LazyFrame:
-    """Read parquet into GPU memory via cuDF with explicit DPP.
+    """Read parquet into GPU memory via kvikio pread + cuDF with DPP.
 
-    DPP (issue #4): if h0_filter is provided, only files whose hive partition
-    path matches an h0 value in the set are read. This prevents OOM on large
-    partitioned datasets (e.g. global carbon with 122 h0 partitions).
+    S3 transport: kvikio.RemoteFile.pread() with parallel chunked HTTP range
+    requests. Requires KVIKIO_NTHREADS=64 env var (set_num_threads() is broken
+    in kvikio 25.02). Achieves ~6 Gbps vs ~1 Gbps from Polars Rust object_store
+    for large files (benchmark on carbon Americas, 28 files, 3.22 GiB). See #3.
 
-    S3 transport: cudf.read_parquet(storage_options=...) routes through PyArrow
-    S3FileSystem, NOT kvikio (see issue #3). We use s3fs only for glob resolution
-    then pass the file list to cudf. Falls back to Polars Rust reader on any
-    failure; note that Polars Rust object_store is currently faster than cuDF+PyArrow
-    S3 for the internal Ceph endpoint.
+    DPP: h0_filter prunes hive partitions before reading, preventing OOM on
+    large datasets like global carbon (94 files, 7.3 GiB). See issue #4.
+
+    Falls back to Polars Rust reader on any failure.
     """
     try:
         import cudf
 
-        # Use s3fs only for glob resolution (fast, single call per dataset).
-        # The actual parquet reads below use cuDF's native reader + kvikio.
+        endpoint = storage_options.get("endpoint_url", "")
+
+        # Use s3fs for glob resolution only (single API call to list files).
         fs = _s3fs_from_storage_options(storage_options)
         path_no_scheme = s3_path.removeprefix("s3://")
         base = path_no_scheme.rstrip("/").rstrip("*").rstrip("/")
@@ -177,40 +198,50 @@ def _scan_cudf(
         if not raw_files:
             raise FileNotFoundError(f"No parquet files found at {s3_path}")
 
-        files = [f"s3://{f}" for f in raw_files]
+        files_s3 = [f"s3://{f}" for f in raw_files]
 
         # --- DPP: filter to matching h0 partitions before reading ---
         if h0_filter:
-            before = len(files)
-            files = _filter_files_by_h0(files, h0_filter)
+            before = len(files_s3)
+            files_s3 = _filter_files_by_h0(files_s3, h0_filter)
             print(
-                f"  [cudf DPP] {s3_path.split('/')[-2]}: {before} → {len(files)} files "
+                f"  [cudf DPP] {s3_path.split('/')[-2]}: {before} → {len(files_s3)} files "
                 f"({len(h0_filter)} h0 values)",
                 file=sys.stderr,
             )
-            if not files:
-                # No matching partitions — return empty LazyFrame
+            if not files_s3:
                 print(f"  [cudf DPP] no files after pruning, returning empty", file=sys.stderr)
                 return pl.LazyFrame()
 
-        # cudf.read_parquet with storage_options uses PyArrow S3FileSystem internally,
-        # not kvikio (despite what RAPIDS docs suggest). See issue #3 for investigation.
-        anon = storage_options.get("skip_signature") == "true"
-        endpoint = storage_options.get("endpoint_url", "")
-        cudf_storage = {"endpoint_url": endpoint}
-        if anon:
-            cudf_storage["anon"] = True
-        else:
-            cudf_storage["key"] = storage_options.get("aws_access_key_id", "")
-            cudf_storage["secret"] = storage_options.get("aws_secret_access_key", "")
+        # Build HTTP URLs for kvikio (swap s3:// for internal HTTP endpoint)
+        # e.g. s3://public-carbon/... → http://rook-ceph-rgw-nautiluss3.rook/public-carbon/...
+        files_http = [
+            endpoint.rstrip("/") + "/" + f.removeprefix("s3://")
+            for f in files_s3
+        ]
 
-        df_cudf = cudf.read_parquet(
-            files,
-            storage_options=cudf_storage,
-            hive_partitioning=True,
-        )
+        # Extract h0 value from each file path for hive partition column injection
+        h0_per_file = [
+            int(m.group(1)) if (m := _H0_PATH_RE.search(f)) else 0
+            for f in files_s3
+        ]
 
-        # Convert to Polars via Arrow for SQLContext registration
+        # --- kvikio parallel pread: download all files concurrently ---
+        # n_workers = min(len(files_http), 64) — one Python thread per file,
+        # each thread uses kvikio's internal thread pool for chunked range requests.
+        n_workers = min(len(files_http), 64)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results = list(pool.map(_kvikio_download_one, zip(files_http, h0_per_file)))
+
+        # --- cuDF parse each downloaded buffer + inject hive partition columns ---
+        dfs = []
+        for raw_bytes, h0_val in results:
+            df_part = cudf.read_parquet(io.BytesIO(raw_bytes))
+            if "h0" not in df_part.columns:
+                df_part["h0"] = h0_val
+            dfs.append(df_part)
+
+        df_cudf = cudf.concat(dfs, ignore_index=True)
         return pl.from_arrow(df_cudf.to_arrow()).lazy()
 
     except Exception as e:
