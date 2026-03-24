@@ -68,7 +68,7 @@ WITH carbon AS (
   FROM read_parquet('s3://public-carbon/irrecoverable-carbon-2024/hex/**')
   GROUP BY h8, h0
 )
-SELECT a.h8, a.total_carbon, b.combined_sr, b.combined_thr_sr
+SELECT a.h8, a.total_carbon, b.combined_sr
 FROM carbon a
 JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
   ON a.h8 = b.h8 AND a.h0 = b.h0""",
@@ -107,10 +107,11 @@ JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
 GROUP BY a.h8, b.combined_sr""",
 
     "Q7": """\
-SELECT a.h0, SUM(a.n) AS gbif_count, AVG(b.combined_sr) AS mean_richness
+SELECT CAST(a.h0 AS BIGINT) AS h0, SUM(a.n) AS gbif_count, AVG(b.combined_sr) AS mean_richness
 FROM read_parquet('s3://public-gbif/taxonomy/**') a
-JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b ON a.h0 = b.h0
-GROUP BY a.h0""",
+JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
+  ON CAST(a.h0 AS BIGINT) = b.h0
+GROUP BY CAST(a.h0 AS BIGINT)""",
 }
 
 # Row-count queries — COUNT(*) wrapper for correctness checking (run once, not timed)
@@ -124,6 +125,7 @@ COUNT_QUERIES = {
 # ---------------------------------------------------------------------------
 
 _SEPARATOR_RE = re.compile(r"^\|[\s|:+-]+\|$")
+_COUNT_RE = re.compile(r"\|\s*(\d[\d,]*)\s*\|")
 
 
 def parse_row_count(text: str) -> int | None:
@@ -137,6 +139,22 @@ def parse_row_count(text: str) -> int | None:
     return max(0, len(lines) - 1)  # subtract header row
 
 
+def parse_count_result(text: str) -> int | None:
+    """Extract integer from a COUNT(*) result (handles Polars repeating rows)."""
+    if not text or text.startswith("SQL Error") or text.startswith("Error"):
+        return None
+    # Find the first numeric value in a data row (skip header)
+    data_lines = [
+        l for l in text.strip().splitlines()
+        if l.strip().startswith("|") and not _SEPARATOR_RE.match(l.strip())
+    ]
+    for line in data_lines[1:]:  # skip header
+        m = _COUNT_RE.search(line)
+        if m:
+            return int(m.group(1).replace(",", ""))
+    return None
+
+
 def is_sql_error(text: str) -> str | None:
     """Return error message if result text is an SQL error, else None."""
     if text.startswith("SQL Error") or text.startswith("Error:"):
@@ -144,10 +162,15 @@ def is_sql_error(text: str) -> str | None:
     return None
 
 
-async def call_tool(session: ClientSession, sql: str) -> tuple[str, float]:
+async def call_tool(
+    session: ClientSession, sql: str, timeout_s: float = 600.0
+) -> tuple[str, float]:
     """Call the query tool; return (result_text, elapsed_seconds)."""
     start = time.perf_counter()
-    result = await session.call_tool("query", {"sql_query": sql})
+    result = await asyncio.wait_for(
+        session.call_tool("query", {"sql_query": sql}),
+        timeout=timeout_s,
+    )
     elapsed = time.perf_counter() - start
     text = ""
     if result.content:
@@ -166,6 +189,7 @@ async def benchmark_server(
     query_ids: list[str],
     n_runs: int,
     results: list[dict],
+    query_timeout: float = 600.0,
 ) -> None:
     print(f"\n{'='*64}")
     print(f"  Server: {name}  —  {url}")
@@ -183,26 +207,23 @@ async def benchmark_server(
             for qid in query_ids:
                 sql = QUERIES[qid]
 
-                # Run COUNT(*) once for row count (untimed)
+                # Run COUNT(*) once for row count (untimed), with a short timeout.
+                # Skip for large-dataset queries (Q3+) where COUNT can take minutes.
+                SKIP_COUNT = {"Q3", "Q4", "Q5", "Q6", "Q7"}
                 row_count = None
-                try:
-                    text, _ = await call_tool(session, COUNT_QUERIES[qid])
-                    err = is_sql_error(text)
-                    if not err:
-                        rc = parse_row_count(text)
-                        if rc == 1:
-                            # COUNT result is one row with a single number
-                            m = re.search(r"\|\s*([\d,]+)\s*\|", text.split("\n")[-1])
-                            if m:
-                                row_count = int(m.group(1).replace(",", ""))
-                except Exception:
-                    pass
+                if qid not in SKIP_COUNT:
+                    try:
+                        text, _ = await call_tool(session, COUNT_QUERIES[qid], timeout_s=120.0)
+                        if not is_sql_error(text):
+                            row_count = parse_count_result(text)
+                    except Exception:
+                        pass
 
                 for run in range(1, n_runs + 1):
                     elapsed = None
                     error = None
                     try:
-                        text, elapsed = await call_tool(session, sql)
+                        text, elapsed = await call_tool(session, sql, timeout_s=query_timeout)
                         error = is_sql_error(text)
                     except Exception as exc:
                         error = str(exc)[:300]
@@ -289,6 +310,10 @@ async def main() -> None:
         "--output", default="benchmarks/results.csv",
         help="CSV output path (default: benchmarks/results.csv)",
     )
+    parser.add_argument(
+        "--timeout", type=float, default=600.0,
+        help="Per-query timeout in seconds (default: 600)",
+    )
     args = parser.parse_args()
 
     query_ids = [q.strip() for q in args.queries.split(",") if q.strip() in QUERIES]
@@ -307,7 +332,8 @@ async def main() -> None:
 
     results: list[dict] = []
     for name in server_names:
-        await benchmark_server(name, SERVERS[name], query_ids, args.runs, results)
+        await benchmark_server(name, SERVERS[name], query_ids, args.runs, results,
+                               query_timeout=args.timeout)
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

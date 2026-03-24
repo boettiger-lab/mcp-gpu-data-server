@@ -59,7 +59,7 @@ WITH carbon AS (
   FROM read_parquet('s3://public-carbon/irrecoverable-carbon-2024/hex/**')
   GROUP BY h8, h0
 )
-SELECT a.h8, a.total_carbon, b.combined_sr, b.combined_thr_sr
+SELECT a.h8, a.total_carbon, b.combined_sr
 FROM carbon a
 JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b ON a.h8 = b.h8 AND a.h0 = b.h0
 ```
@@ -113,10 +113,11 @@ GROUP BY a.h8, b.combined_sr
 
 ### Q7 — Coarse resolution join (h0 cross-scale)
 ```sql
-SELECT a.h0, SUM(a.n) AS gbif_count, AVG(b.combined_sr) AS mean_richness
+SELECT CAST(a.h0 AS BIGINT) AS h0, SUM(a.n) AS gbif_count, AVG(b.combined_sr) AS mean_richness
 FROM read_parquet('s3://public-gbif/taxonomy/**') a
-JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b ON a.h0 = b.h0
-GROUP BY a.h0
+JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
+  ON CAST(a.h0 AS BIGINT) = b.h0
+GROUP BY CAST(a.h0 AS BIGINT)
 ```
 Joins at H3 resolution 0 (coarse). h0-only join so single key is correct here; no h8 to include.
 
@@ -168,6 +169,26 @@ requires knowing the h0 value up front. For global/multi-partition queries, use 
 - **Correctness parity**: results must be identical (modulo float rounding) between servers.
 
 ---
+
+## GPU VRAM Constraint
+
+The NRP GPU node uses an **NVIDIA RTX 4000 Ada (20 GB VRAM)**. Polars cuDF GPU engine
+fully materialises each source table in VRAM; it does not stream or spill to CPU.
+
+| Query | Approx in-memory size | GPU feasible? |
+|---|---|---|
+| Q1 (IUCN × IUCN) | ~0.5 GiB | ✓ |
+| Q2 (3-way IUCN) | ~0.7 GiB | ✓ |
+| Q3 (carbon 9.9 GiB × IUCN) | ~30 GiB uncompressed | ✗ OOM |
+| Q4 (WDPA × carbon) | ~30 GiB | ✗ OOM |
+| Q5 (4-way + carbon) | ~30 GiB | ✗ OOM |
+| Q6 (GBIF 119 GiB × IUCN) | >100 GiB | ✗ OOM |
+| Q7 (taxonomy tiny × IUCN) | <0.1 GiB | ✓ |
+
+Q3-Q6 are benchmarked CPU-only. A node with ≥40 GB VRAM (e.g. A100 80GB or
+H100 80GB) would be needed for GPU to compete on the large-dataset queries.
+The KvikIO/cuDF branch adds GPU-accelerated decompression which would still
+benefit Q3-Q5 on a larger GPU.
 
 ## Known Issue: duckdb-geo STAC Catalog Empty
 
