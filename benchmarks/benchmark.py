@@ -62,6 +62,8 @@ JOIN read_parquet('s3://public-iucn/hex/birds_sr/**') b
 JOIN read_parquet('s3://public-iucn/hex/mammals_sr/**') c
   ON a.h8 = c.h8 AND a.h0 = c.h0""",
 
+    # Q3/Q4/Q5: full global carbon (9.9 GiB compressed → ~30 GB uncompressed) — CPU only,
+    # exceeds 20 GB VRAM on RTX 4000 Ada.
     "Q3": """\
 WITH carbon AS (
   SELECT h8, h0, SUM(carbon) AS total_carbon
@@ -98,6 +100,70 @@ JOIN read_parquet('s3://public-iucn/hex/birds_sr/**') c
   ON a.h8 = c.h8 AND a.h0 = c.h0
 JOIN read_parquet('s3://public-social-vulnerability/svi-2022-tract/hex/h0=*/data_0.parquet') d
   ON a.h8 = d.h8 AND a.h0 = d.h0""",
+
+    # Q3a/Q4a/Q5a: Americas subset (~28 h0 cells, ~2-4 GiB compressed, ~8-12 GB uncompressed).
+    # Fits in 20 GB VRAM — GPU and CPU comparable test.
+    "Q3a": """\
+WITH carbon AS (
+  SELECT h8, h0, SUM(carbon) AS total_carbon
+  FROM read_parquet('s3://public-carbon/irrecoverable-carbon-2024/hex/**')
+  WHERE h0 IN (
+    576531121047601151, 576707042908045311, 576742227280134143, 576812596024311807,
+    576882964768489471, 576953333512667135, 576988517884755967, 577094071001022463,
+    577164439745200127, 577199624117288959, 577234808489377791, 577692205326532607,
+    577727389698621439, 577762574070710271, 578114417791598591, 578149602163687423,
+    578290339652042751, 578395892768309247, 578747736489197567, 578923658349641727,
+    578994027093819391, 579381055186796543, 579451423930974207, 579592161419329535,
+    579627345791418367, 579908820768129023, 580119927000662015, 580401401977372671
+  )
+  GROUP BY h8, h0
+)
+SELECT a.h8, a.total_carbon, b.combined_sr
+FROM carbon a
+JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
+  ON a.h8 = b.h8 AND a.h0 = b.h0""",
+
+    "Q4a": """\
+WITH carbon AS (
+  SELECT h8, h0, SUM(carbon) AS total_carbon
+  FROM read_parquet('s3://public-carbon/irrecoverable-carbon-2024/hex/**')
+  WHERE h0 IN (
+    576531121047601151, 576707042908045311, 576742227280134143, 576812596024311807,
+    576882964768489471, 576953333512667135, 576988517884755967, 577094071001022463,
+    577164439745200127, 577199624117288959, 577234808489377791, 577692205326532607,
+    577727389698621439, 577762574070710271, 578114417791598591, 578149602163687423,
+    578290339652042751, 578395892768309247, 578747736489197567, 578923658349641727,
+    578994027093819391, 579381055186796543, 579451423930974207, 579592161419329535,
+    579627345791418367, 579908820768129023, 580119927000662015, 580401401977372671
+  )
+  GROUP BY h8, h0
+)
+SELECT b.h8, b.total_carbon, COUNT(DISTINCT a.SITE_ID) AS n_protected_areas
+FROM read_parquet('s3://public-wdpa/hex/**') a
+JOIN carbon b ON a.h8 = b.h8 AND a.h0 = b.h0
+GROUP BY b.h8, b.total_carbon""",
+
+    "Q5a": """\
+WITH carbon AS (
+  SELECT h8, h0, SUM(carbon) AS total_carbon
+  FROM read_parquet('s3://public-carbon/irrecoverable-carbon-2024/hex/**')
+  WHERE h0 IN (
+    576531121047601151, 576707042908045311, 576742227280134143, 576812596024311807,
+    576882964768489471, 576953333512667135, 576988517884755967, 577094071001022463,
+    577164439745200127, 577199624117288959, 577234808489377791, 577692205326532607,
+    577727389698621439, 577762574070710271, 578114417791598591, 578149602163687423,
+    578290339652042751, 578395892768309247, 578747736489197567, 578923658349641727,
+    578994027093819391, 579381055186796543, 579451423930974207, 579592161419329535,
+    579627345791418367, 579908820768129023, 580119927000662015, 580401401977372671
+  )
+  GROUP BY h8, h0
+)
+SELECT a.h8, a.total_carbon, b.combined_sr, c.birds_sr
+FROM carbon a
+JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
+  ON a.h8 = b.h8 AND a.h0 = b.h0
+JOIN read_parquet('s3://public-iucn/hex/birds_sr/**') c
+  ON a.h8 = c.h8 AND a.h0 = c.h0""",
 
     "Q6": """\
 SELECT a.h8, COUNT(*) AS gbif_obs, b.combined_sr
@@ -209,7 +275,7 @@ async def benchmark_server(
 
                 # Run COUNT(*) once for row count (untimed), with a short timeout.
                 # Skip for large-dataset queries (Q3+) where COUNT can take minutes.
-                SKIP_COUNT = {"Q3", "Q4", "Q5", "Q6", "Q7"}
+                SKIP_COUNT = {"Q3", "Q4", "Q5", "Q3a", "Q4a", "Q5a", "Q6", "Q7"}
                 row_count = None
                 if qid not in SKIP_COUNT:
                     try:
