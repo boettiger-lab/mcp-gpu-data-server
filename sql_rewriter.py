@@ -11,16 +11,14 @@ Two I/O backends are supported, selected by the `use_cudf_io` flag:
   Polars (default)
     pl.scan_parquet → lazy evaluation, CPU decompression, then GPU compute.
     Path: S3 → Rust object_store → CPU RAM → PCIe → GPU VRAM → cuDF
+    Partition pruning: automatic via Polars lazy query optimizer (DPP).
 
   cuDF (GPU-direct)
     cudf.read_parquet → GPU-accelerated parquet decompression, eager read.
-    Path: S3 → s3fs (CPU network) → GPU decompression → GPU VRAM → cuDF
-    With kvikio installed: file I/O uses GDS/RDMA when available.
-    Path: S3 → kvikio RDMA → GPU VRAM directly (if 100G IB + GDS)
-
-The cuDF path eagerly materialises each source table into GPU VRAM before
-query execution. For datasets larger than GPU memory, use the Polars path
-(which supports lazy partition pruning and streaming).
+    Path: S3 → kvikio concurrent HTTP → CPU RAM → GPU decompression → VRAM
+    Partition pruning: explicit h0 predicate extraction before read (issue #4).
+    KvikIO transport: cuDF native S3 reader via storage_options (issue #3).
+      ~9 Gbps vs ~2 Gbps from s3fs, using chunked concurrent HTTP range requests.
 """
 
 import re
@@ -58,6 +56,14 @@ H3_TO_STRING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches: h0 IN (v1, v2, ...) or h0 = V  (integer H3 cell IDs)
+# Used to extract partition filter values for DPP in gpu-cudf mode.
+_H0_IN_RE = re.compile(r"\bh0\s+IN\s*\(([^)]+)\)", re.IGNORECASE)
+_H0_EQ_RE = re.compile(r"\bh0\s*=\s*(\d+)", re.IGNORECASE)
+
+# Matches the h0 hive partition component in a file path
+_H0_PATH_RE = re.compile(r"/h0=(\d+)/")
+
 
 def extract_parquet_sources(sql: str) -> dict[str, str]:
     """Extract all read_parquet('path') calls and assign deterministic aliases.
@@ -70,6 +76,43 @@ def extract_parquet_sources(sql: str) -> dict[str, str]:
         if s3_path not in paths:
             paths[s3_path] = f"__tbl_{len(paths)}"
     return paths
+
+
+def extract_h0_predicates(sql: str) -> frozenset[int] | None:
+    """Extract integer h0 partition values from WHERE/filter predicates.
+
+    Handles:
+      h0 IN (v1, v2, ...)
+      h0 = V
+
+    Returns a frozenset of integers if any h0 filter found, else None.
+    Used by _scan_cudf to prune hive partitions before reading (DPP).
+    """
+    values: set[int] = set()
+    for m in _H0_IN_RE.finditer(sql):
+        for v in m.group(1).split(","):
+            v = v.strip()
+            if v.lstrip("-").isdigit():
+                values.add(int(v))
+    for m in _H0_EQ_RE.finditer(sql):
+        values.add(int(m.group(1)))
+    return frozenset(values) if values else None
+
+
+def _filter_files_by_h0(files: list[str], h0_values: frozenset[int]) -> list[str]:
+    """Keep only hive-partitioned files whose h0 component is in h0_values.
+
+    Files without an h0= path component are always kept (non-partitioned).
+    """
+    result = []
+    for f in files:
+        m = _H0_PATH_RE.search(f)
+        if m:
+            if int(m.group(1)) in h0_values:
+                result.append(f)
+        else:
+            result.append(f)
+    return result
 
 
 def rewrite_functions(sql: str) -> str:
@@ -98,36 +141,66 @@ def _s3fs_from_storage_options(storage_options: dict):
     )
 
 
-def _scan_cudf(s3_path: str, storage_options: dict) -> pl.LazyFrame:
-    """Read parquet into GPU memory via cuDF, return as a Polars LazyFrame.
+def _scan_cudf(
+    s3_path: str,
+    storage_options: dict,
+    h0_filter: frozenset[int] | None = None,
+) -> pl.LazyFrame:
+    """Read parquet into GPU memory via cuDF with KvikIO S3 transport + DPP.
 
-    Uses GPU-accelerated parquet decompression (libcudf). When kvikio is
-    installed and GDS is available on the node, file reads use GPUDirect
-    Storage (RDMA), bypassing CPU DRAM entirely.
+    DPP (issue #4): if h0_filter is provided, only files whose hive partition
+    path matches an h0 value in the set are read. This prevents OOM on large
+    partitioned datasets (e.g. global carbon with 122 h0 partitions).
+
+    KvikIO transport (issue #3): uses cuDF's native S3 reader via storage_options
+    rather than s3fs, so libcudf routes reads through kvikio's concurrent HTTP
+    downloader (~9 Gbps with 64 threads + 16 MiB chunks vs ~2 Gbps from s3fs).
 
     Falls back to Polars CPU reader on any failure.
     """
     try:
         import cudf
-        fs = _s3fs_from_storage_options(storage_options)
 
-        # Resolve glob to explicit file list (s3fs handles /** recursion)
+        # Use s3fs only for glob resolution (fast, single call per dataset).
+        # The actual parquet reads below use cuDF's native reader + kvikio.
+        fs = _s3fs_from_storage_options(storage_options)
         path_no_scheme = s3_path.removeprefix("s3://")
-        # Strip trailing /** or /* for directory listing
         base = path_no_scheme.rstrip("/").rstrip("*").rstrip("/")
-        files = fs.glob(base + "/**/*.parquet") or fs.glob(base + "/*.parquet")
-        if not files:
+        raw_files = fs.glob(base + "/**/*.parquet") or fs.glob(base + "/*.parquet")
+        if not raw_files:
             raise FileNotFoundError(f"No parquet files found at {s3_path}")
 
-        s3_files = [f"s3://{f}" for f in files]
+        files = [f"s3://{f}" for f in raw_files]
 
-        # cudf.read_parquet uses libcudf's GPU-accelerated reader.
-        # With kvikio installed, GDS intercepts local/RDMA reads when
-        # supported by the hardware; for S3, file data still traverses
-        # the network stack but decompression happens on GPU.
+        # --- DPP: filter to matching h0 partitions before reading ---
+        if h0_filter:
+            before = len(files)
+            files = _filter_files_by_h0(files, h0_filter)
+            print(
+                f"  [cudf DPP] {s3_path.split('/')[-2]}: {before} → {len(files)} files "
+                f"({len(h0_filter)} h0 values)",
+                file=sys.stderr,
+            )
+            if not files:
+                # No matching partitions — return empty LazyFrame
+                print(f"  [cudf DPP] no files after pruning, returning empty", file=sys.stderr)
+                return pl.LazyFrame()
+
+        # --- KvikIO transport: pass storage_options instead of filesystem= ---
+        # cuDF's native reader routes S3 reads through kvikio when installed,
+        # using concurrent chunked HTTP range requests instead of s3fs.
+        anon = storage_options.get("skip_signature") == "true"
+        endpoint = storage_options.get("endpoint_url", "")
+        cudf_storage = {"endpoint_url": endpoint}
+        if anon:
+            cudf_storage["anon"] = True
+        else:
+            cudf_storage["key"] = storage_options.get("aws_access_key_id", "")
+            cudf_storage["secret"] = storage_options.get("aws_secret_access_key", "")
+
         df_cudf = cudf.read_parquet(
-            s3_files,
-            filesystem=fs,
+            files,
+            storage_options=cudf_storage,
             hive_partitioning=True,
         )
 
@@ -153,7 +226,7 @@ def rewrite_sql(
         sql: DuckDB-dialect SQL with read_parquet() inline table functions.
         storage_options: S3 connection options (endpoint, credentials).
         use_cudf_io: If True, read parquet via cuDF (GPU decompression +
-            optional kvikio RDMA) instead of Polars' CPU reader.
+            kvikio concurrent S3 transport + explicit DPP) instead of Polars.
 
     Returns:
         (rewritten_sql, sql_context, copy_dest_path, copy_format)
@@ -182,13 +255,19 @@ def rewrite_sql(
             "For cross-resolution joins, pick the coarser shared column."
         )
 
+    # In gpu-cudf mode, extract h0 predicates for DPP before reading any files.
+    # The Polars path gets DPP for free via lazy evaluation; cudf needs it explicit.
+    h0_filter = extract_h0_predicates(sql) if use_cudf_io else None
+    if h0_filter:
+        print(f"  [cudf DPP] extracted {len(h0_filter)} h0 values from SQL", file=sys.stderr)
+
     # Extract and register parquet sources
     path_aliases = extract_parquet_sources(sql)
     ctx = pl.SQLContext()
 
     for s3_path, alias in path_aliases.items():
         if use_cudf_io:
-            lf = _scan_cudf(s3_path, storage_options)
+            lf = _scan_cudf(s3_path, storage_options, h0_filter=h0_filter)
         else:
             lf = pl.scan_parquet(
                 s3_path,

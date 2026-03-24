@@ -5,16 +5,18 @@ optional GPU acceleration (RAPIDS cuDF backend).
 Two I/O backends are available (set QUERY_ENGINE env var):
 
   QUERY_ENGINE=gpu        (default) Polars lazy reader + cuDF GPU compute
-  QUERY_ENGINE=gpu-cudf   cuDF eager reader (GPU decompression + kvikio
-                          RDMA when available) + cuDF GPU compute
+  QUERY_ENGINE=gpu-cudf   cuDF eager reader (kvikio concurrent S3 transport +
+                          GPU parquet decompression) + cuDF GPU compute
   QUERY_ENGINE=cpu        Polars CPU reader + CPU compute (no GPU)
 
 The gpu-cudf mode uses cudf.read_parquet which:
+  - Reads S3 via kvikio's concurrent chunked HTTP transport (~9 Gbps on 100G IB
+    with 64 threads + 16 MiB chunks, vs ~2 Gbps from s3fs/boto3)
   - Decompresses parquet on GPU (faster than CPU for snappy/zstd)
-  - Uses kvikio GDS/RDMA when installed and the hardware supports it
-    (e.g. 100G InfiniBand on NRP Nautilus nodes)
-  - Materialises each source table eagerly — do not use for datasets
-    larger than GPU VRAM.
+  - Applies explicit partition pruning (DPP) before reading: h0 IN (...)
+    predicates are extracted from SQL and used to filter the file list,
+    preventing OOM on large partitioned datasets.
+  - Materialises each pruned table eagerly — size after pruning must fit VRAM.
 """
 
 import os
@@ -41,12 +43,15 @@ try:
     import kvikio
     import kvikio.defaults
     _KVIKIO_AVAILABLE = True
-    # Prefer GDS/RDMA; fall back to compat (CPU-assisted) mode automatically
-    kvikio.defaults.num_threads(16)  # parallel I/O threads
+    # High-performance S3 transport: 64 threads + 16 MiB chunks saturates
+    # 100G InfiniBand and matches the NVIDIA-recommended config for ~9 Gbps.
+    # See https://developer.nvidia.com/blog/high-performance-remote-io-with-nvidia-kvikio/
+    kvikio.defaults.num_threads(64)
+    kvikio.defaults.task_size(16 * 1024 * 1024)  # 16 MiB per request
     _gds = kvikio.is_remote_file_supported()
     print(
-        f"kvikio available — GDS/RDMA supported: {_gds}  "
-        f"(compat mode: {kvikio.defaults.compat_mode()})",
+        f"kvikio available — threads: 64, task_size: 16MiB, "
+        f"remote_file: {_gds}, compat_mode: {kvikio.defaults.compat_mode()}",
         file=sys.stderr,
     )
 except ImportError:
