@@ -8,17 +8,24 @@ pre-registered).
 
 Two I/O backends are supported, selected by the `use_cudf_io` flag:
 
-  Polars (default)
+  Polars (default) — recommended
     pl.scan_parquet → lazy evaluation, CPU decompression, then GPU compute.
-    Path: S3 → Rust object_store → CPU RAM → PCIe → GPU VRAM → cuDF
+    Path: S3 → Polars Rust object_store → CPU RAM → PCIe → GPU VRAM → cuDF
     Partition pruning: automatic via Polars lazy query optimizer (DPP).
+    S3 transport: Rust object_store (~10.8s for 548 files, 0.06 GiB).
 
-  cuDF (GPU-direct)
+  cuDF (gpu-cudf mode) — experimental
     cudf.read_parquet → GPU-accelerated parquet decompression, eager read.
-    Path: S3 → kvikio concurrent HTTP → CPU RAM → GPU decompression → VRAM
+    Path: S3 → PyArrow S3FileSystem → CPU RAM → GPU decompression → VRAM
     Partition pruning: explicit h0 predicate extraction before read (issue #4).
-    KvikIO transport: cuDF native S3 reader via storage_options (issue #3).
-      ~9 Gbps vs ~2 Gbps from s3fs, using chunked concurrent HTTP range requests.
+    NOTE: cudf.read_parquet(storage_options=...) routes through PyArrow S3,
+    NOT kvikio, despite what the RAPIDS docs imply. See issue #3.
+    S3 transport benchmark (IUCN, 548 files, 0.06 GiB, internal Ceph):
+      Polars Rust object_store:    10.8s  ← fastest
+      kvikio.RemoteFile.open_http: 33.1s  (30.1s download across 32 workers)
+      cudf.read_parquet (PyArrow): ~same as Polars (routes same path)
+    The public HTTPS endpoint (s3-west.nrp-nautilus.io) has TLS handshake
+    timeout from inside the cluster, blocking kvikio HTTPS tests (issue #3).
 """
 
 import re
@@ -146,17 +153,17 @@ def _scan_cudf(
     storage_options: dict,
     h0_filter: frozenset[int] | None = None,
 ) -> pl.LazyFrame:
-    """Read parquet into GPU memory via cuDF with KvikIO S3 transport + DPP.
+    """Read parquet into GPU memory via cuDF with explicit DPP.
 
     DPP (issue #4): if h0_filter is provided, only files whose hive partition
     path matches an h0 value in the set are read. This prevents OOM on large
     partitioned datasets (e.g. global carbon with 122 h0 partitions).
 
-    KvikIO transport (issue #3): uses cuDF's native S3 reader via storage_options
-    rather than s3fs, so libcudf routes reads through kvikio's concurrent HTTP
-    downloader (~9 Gbps with 64 threads + 16 MiB chunks vs ~2 Gbps from s3fs).
-
-    Falls back to Polars CPU reader on any failure.
+    S3 transport: cudf.read_parquet(storage_options=...) routes through PyArrow
+    S3FileSystem, NOT kvikio (see issue #3). We use s3fs only for glob resolution
+    then pass the file list to cudf. Falls back to Polars Rust reader on any
+    failure; note that Polars Rust object_store is currently faster than cuDF+PyArrow
+    S3 for the internal Ceph endpoint.
     """
     try:
         import cudf
@@ -186,9 +193,8 @@ def _scan_cudf(
                 print(f"  [cudf DPP] no files after pruning, returning empty", file=sys.stderr)
                 return pl.LazyFrame()
 
-        # --- KvikIO transport: pass storage_options instead of filesystem= ---
-        # cuDF's native reader routes S3 reads through kvikio when installed,
-        # using concurrent chunked HTTP range requests instead of s3fs.
+        # cudf.read_parquet with storage_options uses PyArrow S3FileSystem internally,
+        # not kvikio (despite what RAPIDS docs suggest). See issue #3 for investigation.
         anon = storage_options.get("skip_signature") == "true"
         endpoint = storage_options.get("endpoint_url", "")
         cudf_storage = {"endpoint_url": endpoint}
