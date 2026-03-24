@@ -21,12 +21,12 @@ spec:
         kubernetes.io/hostname: stratus1.nrp-espm.berkeley.edu
       containers:
       - name: server
-        image: ghcr.io/boettiger-lab/mcp-gpu-data-server:latest
+        image: ghcr.io/boettiger-lab/mcp-gpu-data-server:kvikio-gpu-direct
         env:
         - name: STAC_CATALOG_URL
           value: "https://s3-west.nrp-nautilus.io/public-data/stac/catalog.json"
         - name: QUERY_ENGINE
-          value: "gpu"
+          value: "gpu-cudf"
         resources:
           requests:
             memory: 32Gi
