@@ -123,9 +123,12 @@ FROM carbon a
 JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
   ON a.h8 = b.h8 AND a.h0 = b.h0""",
 
+    # Q4a: alias carbon h8/h0 to avoid column name collision with WDPA (both have h8/h0).
+    # Polars strict GROUP BY rejects ambiguous column references like b.h8 when both
+    # sides of a join share the same column name.
     "Q4a": """\
 WITH carbon AS (
-  SELECT h8, h0, SUM(carbon) AS total_carbon
+  SELECT h8 AS carbon_h8, h0 AS carbon_h0, SUM(carbon) AS total_carbon
   FROM read_parquet('s3://public-carbon/irrecoverable-carbon-2024/hex/**')
   WHERE h0 IN (
     576531121047601151, 576707042908045311, 576742227280134143, 576812596024311807,
@@ -138,10 +141,10 @@ WITH carbon AS (
   )
   GROUP BY h8, h0
 )
-SELECT b.h8, b.total_carbon, COUNT(DISTINCT a.SITE_ID) AS n_protected_areas
+SELECT b.carbon_h8 AS h8, b.total_carbon, COUNT(DISTINCT a.SITE_ID) AS n_protected_areas
 FROM read_parquet('s3://public-wdpa/hex/**') a
-JOIN carbon b ON a.h8 = b.h8 AND a.h0 = b.h0
-GROUP BY b.h8, b.total_carbon""",
+JOIN carbon b ON a.h8 = b.carbon_h8 AND a.h0 = b.carbon_h0
+GROUP BY b.carbon_h8, b.total_carbon""",
 
     "Q5a": """\
 WITH carbon AS (
@@ -172,12 +175,20 @@ JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
   ON a.h8 = b.h8 AND a.h0 = b.h0
 GROUP BY a.h8, b.combined_sr""",
 
+    # Q7: taxonomy h0 is stored as hex string (e.g. '8001FFFFFFFFFFF') instead of INT64.
+    # Blocked on data-workflows issue #49. Pre-cast in a CTE so Polars gets a plain
+    # equi-join (Polars forbids CAST in ON clause). DuckDB still errors until the
+    # taxonomy parquet is reprocessed with integer h0.
     "Q7": """\
-SELECT CAST(a.h0 AS BIGINT) AS h0, SUM(a.n) AS gbif_count, AVG(b.combined_sr) AS mean_richness
-FROM read_parquet('s3://public-gbif/taxonomy/**') a
-JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
-  ON CAST(a.h0 AS BIGINT) = b.h0
-GROUP BY CAST(a.h0 AS BIGINT)""",
+WITH tax AS (
+  SELECT CAST(h0 AS BIGINT) AS h0, SUM(n) AS n
+  FROM read_parquet('s3://public-gbif/taxonomy/**')
+  GROUP BY h0
+)
+SELECT a.h0, a.n AS gbif_count, AVG(b.combined_sr) AS mean_richness
+FROM tax a
+JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b ON a.h0 = b.h0
+GROUP BY a.h0, a.n""",
 }
 
 # Row-count queries — COUNT(*) wrapper for correctness checking (run once, not timed)
