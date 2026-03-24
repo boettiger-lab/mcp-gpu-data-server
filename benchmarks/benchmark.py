@@ -168,11 +168,31 @@ JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
 JOIN read_parquet('s3://public-iucn/hex/birds_sr/**') c
   ON a.h8 = c.h8 AND a.h0 = c.h0""",
 
+    # Q6: full global GBIF × IUCN (128 GiB GBIF, 419 files, avg 307 MB each) — CPU only,
+    # exceeds 20 GB VRAM. Best-case for kvikio S3 transport on large files.
     "Q6": """\
 SELECT a.h8, COUNT(*) AS gbif_obs, b.combined_sr
 FROM read_parquet('s3://public-gbif/2025-06/hex/**') a
 JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
   ON a.h8 = b.h8 AND a.h0 = b.h0
+GROUP BY a.h8, b.combined_sr""",
+
+    # Q6a: Americas GBIF × IUCN — 28 h0 filter on GBIF (avg 307 MB files, GPU-feasible subset).
+    # Tests kvikio on largest individual files in the benchmark suite.
+    "Q6a": """\
+SELECT a.h8, COUNT(*) AS gbif_obs, b.combined_sr
+FROM read_parquet('s3://public-gbif/2025-06/hex/**') a
+JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
+  ON a.h8 = b.h8 AND a.h0 = b.h0
+WHERE a.h0 IN (
+  576531121047601151, 576707042908045311, 576742227280134143, 576812596024311807,
+  576882964768489471, 576953333512667135, 576988517884755967, 577094071001022463,
+  577164439745200127, 577199624117288959, 577234808489377791, 577692205326532607,
+  577727389698621439, 577762574070710271, 578114417791598591, 578149602163687423,
+  578290339652042751, 578395892768309247, 578747736489197567, 578923658349641727,
+  578994027093819391, 579381055186796543, 579451423930974207, 579592161419329535,
+  579627345791418367, 579908820768129023, 580119927000662015, 580401401977372671
+)
 GROUP BY a.h8, b.combined_sr""",
 
     # Q7: taxonomy h0 is stored as hex string (e.g. '8001FFFFFFFFFFF') instead of INT64.
@@ -286,7 +306,7 @@ async def benchmark_server(
 
                 # Run COUNT(*) once for row count (untimed), with a short timeout.
                 # Skip for large-dataset queries (Q3+) where COUNT can take minutes.
-                SKIP_COUNT = {"Q3", "Q4", "Q5", "Q3a", "Q4a", "Q5a", "Q6", "Q7"}
+                SKIP_COUNT = {"Q3", "Q4", "Q5", "Q3a", "Q4a", "Q5a", "Q6", "Q6a", "Q7"}
                 row_count = None
                 if qid not in SKIP_COUNT:
                     try:
