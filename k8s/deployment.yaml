@@ -4,6 +4,8 @@ metadata:
   name: gpu-mcp
 spec:
   replicas: 1
+  strategy:
+    type: Recreate   # GPU nodes have 1 GPU; rolling update deadlocks
   selector:
     matchLabels:
       app: gpu-mcp
@@ -30,7 +32,7 @@ spec:
         resources:
           requests:
             memory: 32Gi
-            cpu: 4
+            cpu: 1
             nvidia.com/gpu: 1
           limits:
             memory: 120Gi

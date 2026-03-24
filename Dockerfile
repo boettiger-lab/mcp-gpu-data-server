@@ -2,8 +2,11 @@ FROM nvcr.io/nvidia/rapidsai/base:25.02-cuda12.8-py3.12
 
 WORKDIR /app
 
-# Install Python dependencies.
-# kvikio is pre-installed in the RAPIDS base image (conda) — skip it here.
+# Install kvikio Python bindings (libkvikio C lib is in base; Python bindings
+# are a separate conda package not auto-included in rapidsai/base).
+RUN conda install -c rapidsai kvikio -y --quiet
+
+# Install remaining Python dependencies (kvikio excluded — installed above).
 COPY requirements.txt .
 RUN grep -v '^kvikio' requirements.txt | pip install --no-cache-dir -r /dev/stdin
 

@@ -46,12 +46,13 @@ try:
     # High-performance S3 transport: 64 threads + 16 MiB chunks saturates
     # 100G InfiniBand and matches the NVIDIA-recommended config for ~9 Gbps.
     # See https://developer.nvidia.com/blog/high-performance-remote-io-with-nvidia-kvikio/
-    kvikio.defaults.num_threads(64)
-    kvikio.defaults.task_size(16 * 1024 * 1024)  # 16 MiB per request
-    _gds = kvikio.is_remote_file_supported()
+    kvikio.defaults.set_num_threads(64)
+    kvikio.defaults.set_task_size(16 * 1024 * 1024)  # 16 MiB per request
+    _remote = kvikio.is_remote_file_available()
     print(
-        f"kvikio available — threads: 64, task_size: 16MiB, "
-        f"remote_file: {_gds}, compat_mode: {kvikio.defaults.compat_mode()}",
+        f"kvikio {kvikio.__version__} — threads: {kvikio.defaults.get_num_threads()}, "
+        f"task_size: {kvikio.defaults.task_size() // (1024*1024)}MiB, "
+        f"remote_file: {_remote}, compat_mode: {kvikio.defaults.compat_mode()}",
         file=sys.stderr,
     )
 except ImportError:
