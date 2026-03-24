@@ -5,9 +5,32 @@ registers them as Polars LazyFrames, and rewrites the SQL to use table aliases.
 This bridges the gap between the DuckDB SQL dialect (where read_parquet() is
 an inline table function) and Polars SQLContext (where tables must be
 pre-registered).
+
+Two I/O backends are supported, selected by the `use_cudf_io` flag:
+
+  Polars (default) — recommended
+    pl.scan_parquet → lazy evaluation, CPU decompression, then GPU compute.
+    Path: S3 → Polars Rust object_store → CPU RAM → PCIe → GPU VRAM → cuDF
+    Partition pruning: automatic via Polars lazy query optimizer (DPP).
+    S3 transport: Rust object_store (~10.8s for 548 files, 0.06 GiB).
+
+  cuDF (gpu-cudf mode) — recommended for large-file datasets
+    Path: S3 → kvikio pread (parallel chunked HTTP) → CPU RAM → GPU decompress → VRAM
+    Partition pruning: explicit h0 predicate extraction before read (issue #4).
+    S3 transport: kvikio.RemoteFile.pread() with KVIKIO_NTHREADS=64 env var.
+    S3 transport benchmark (carbon Americas, 28 files, 3.22 GiB, internal Ceph):
+      kvikio pread (64 threads, 16 MiB chunks): 4.1s  6.25 Gbps  ← 6.5x faster
+      Polars Rust object_store:                26.6s  0.97 Gbps
+    NOTE: kvikio.defaults.set_num_threads() is broken in 25.02 — values don't
+    stick. Must use KVIKIO_NTHREADS env var set before library init. See #3.
+    NOTE: cudf.read_parquet(storage_options=...) uses PyArrow S3, NOT kvikio.
+    We use kvikio.RemoteFile.pread() → BytesIO → cudf.read_parquet() instead.
 """
 
+import concurrent.futures
+import io
 import re
+import sys
 import polars as pl
 
 
@@ -41,6 +64,14 @@ H3_TO_STRING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches: h0 IN (v1, v2, ...) or h0 = V  (integer H3 cell IDs)
+# Used to extract partition filter values for DPP in gpu-cudf mode.
+_H0_IN_RE = re.compile(r"\bh0\s+IN\s*\(([^)]+)\)", re.IGNORECASE)
+_H0_EQ_RE = re.compile(r"\bh0\s*=\s*(\d+)", re.IGNORECASE)
+
+# Matches the h0 hive partition component in a file path
+_H0_PATH_RE = re.compile(r"/h0=(\d+)/")
+
 
 def extract_parquet_sources(sql: str) -> dict[str, str]:
     """Extract all read_parquet('path') calls and assign deterministic aliases.
@@ -55,6 +86,43 @@ def extract_parquet_sources(sql: str) -> dict[str, str]:
     return paths
 
 
+def extract_h0_predicates(sql: str) -> frozenset[int] | None:
+    """Extract integer h0 partition values from WHERE/filter predicates.
+
+    Handles:
+      h0 IN (v1, v2, ...)
+      h0 = V
+
+    Returns a frozenset of integers if any h0 filter found, else None.
+    Used by _scan_cudf to prune hive partitions before reading (DPP).
+    """
+    values: set[int] = set()
+    for m in _H0_IN_RE.finditer(sql):
+        for v in m.group(1).split(","):
+            v = v.strip()
+            if v.lstrip("-").isdigit():
+                values.add(int(v))
+    for m in _H0_EQ_RE.finditer(sql):
+        values.add(int(m.group(1)))
+    return frozenset(values) if values else None
+
+
+def _filter_files_by_h0(files: list[str], h0_values: frozenset[int]) -> list[str]:
+    """Keep only hive-partitioned files whose h0 component is in h0_values.
+
+    Files without an h0= path component are always kept (non-partitioned).
+    """
+    result = []
+    for f in files:
+        m = _H0_PATH_RE.search(f)
+        if m:
+            if int(m.group(1)) in h0_values:
+                result.append(f)
+        else:
+            result.append(f)
+    return result
+
+
 def rewrite_functions(sql: str) -> str:
     """Rewrite DuckDB-specific functions to Polars SQL equivalents."""
     # APPROX_COUNT_DISTINCT → COUNT(DISTINCT ...)
@@ -62,11 +130,140 @@ def rewrite_functions(sql: str) -> str:
     return sql
 
 
+def _s3fs_from_storage_options(storage_options: dict):
+    """Build an s3fs filesystem from storage_options dict."""
+    import s3fs
+    anon = storage_options.get("skip_signature") == "true"
+    endpoint = storage_options.get("endpoint_url", "")
+    if anon:
+        return s3fs.S3FileSystem(
+            anon=True,
+            endpoint_url=endpoint,
+            config_kwargs={"allow_http": True},
+        )
+    return s3fs.S3FileSystem(
+        key=storage_options.get("aws_access_key_id"),
+        secret=storage_options.get("aws_secret_access_key"),
+        endpoint_url=endpoint,
+        config_kwargs={"allow_http": True},
+    )
+
+
+def _kvikio_download_one(args: tuple) -> tuple[bytes, int]:
+    """Download a single parquet file via kvikio pread (parallel chunked HTTP).
+
+    Uses pread() rather than read() to activate kvikio's internal thread pool
+    for concurrent range requests. With KVIKIO_NTHREADS=64 and
+    KVIKIO_TASK_SIZE=16777216 this achieves ~6 Gbps on NRP 100G IB.
+
+    Returns (raw_bytes, h0_value) for hive partition column injection.
+    """
+    import kvikio
+    http_url, h0 = args
+    f = kvikio.RemoteFile.open_http(http_url)
+    n = f.nbytes()
+    buf = bytearray(n)
+    fut = f.pread(buf, size=n, file_offset=0)
+    fut.get()
+    return bytes(buf), h0
+
+
+def _scan_cudf(
+    s3_path: str,
+    storage_options: dict,
+    h0_filter: frozenset[int] | None = None,
+) -> pl.LazyFrame:
+    """Read parquet into GPU memory via kvikio pread + cuDF with DPP.
+
+    S3 transport: kvikio.RemoteFile.pread() with parallel chunked HTTP range
+    requests. Requires KVIKIO_NTHREADS=64 env var (set_num_threads() is broken
+    in kvikio 25.02). Achieves ~6 Gbps vs ~1 Gbps from Polars Rust object_store
+    for large files (benchmark on carbon Americas, 28 files, 3.22 GiB). See #3.
+
+    DPP: h0_filter prunes hive partitions before reading, preventing OOM on
+    large datasets like global carbon (94 files, 7.3 GiB). See issue #4.
+
+    Falls back to Polars Rust reader on any failure.
+    """
+    try:
+        import cudf
+
+        endpoint = storage_options.get("endpoint_url", "")
+
+        # Use s3fs for glob resolution only (single API call to list files).
+        fs = _s3fs_from_storage_options(storage_options)
+        path_no_scheme = s3_path.removeprefix("s3://")
+        base = path_no_scheme.rstrip("/").rstrip("*").rstrip("/")
+        raw_files = fs.glob(base + "/**/*.parquet") or fs.glob(base + "/*.parquet")
+        if not raw_files:
+            raise FileNotFoundError(f"No parquet files found at {s3_path}")
+
+        files_s3 = [f"s3://{f}" for f in raw_files]
+
+        # --- DPP: filter to matching h0 partitions before reading ---
+        if h0_filter:
+            before = len(files_s3)
+            files_s3 = _filter_files_by_h0(files_s3, h0_filter)
+            print(
+                f"  [cudf DPP] {s3_path.split('/')[-2]}: {before} → {len(files_s3)} files "
+                f"({len(h0_filter)} h0 values)",
+                file=sys.stderr,
+            )
+            if not files_s3:
+                print(f"  [cudf DPP] no files after pruning, returning empty", file=sys.stderr)
+                return pl.LazyFrame()
+
+        # Build HTTP URLs for kvikio (swap s3:// for internal HTTP endpoint)
+        # e.g. s3://public-carbon/... → http://rook-ceph-rgw-nautiluss3.rook/public-carbon/...
+        files_http = [
+            endpoint.rstrip("/") + "/" + f.removeprefix("s3://")
+            for f in files_s3
+        ]
+
+        # Extract h0 value from each file path for hive partition column injection
+        h0_per_file = [
+            int(m.group(1)) if (m := _H0_PATH_RE.search(f)) else 0
+            for f in files_s3
+        ]
+
+        # --- kvikio parallel pread: download all files concurrently ---
+        # n_workers = min(len(files_http), 64) — one Python thread per file,
+        # each thread uses kvikio's internal thread pool for chunked range requests.
+        n_workers = min(len(files_http), 64)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results = list(pool.map(_kvikio_download_one, zip(files_http, h0_per_file)))
+
+        # --- cuDF parse each downloaded buffer + inject hive partition columns ---
+        dfs = []
+        for raw_bytes, h0_val in results:
+            df_part = cudf.read_parquet(io.BytesIO(raw_bytes))
+            if "h0" not in df_part.columns:
+                df_part["h0"] = h0_val
+            dfs.append(df_part)
+
+        df_cudf = cudf.concat(dfs, ignore_index=True)
+        return pl.from_arrow(df_cudf.to_arrow()).lazy()
+
+    except Exception as e:
+        print(
+            f"cuDF I/O failed for {s3_path} ({e}), falling back to Polars reader",
+            file=sys.stderr,
+        )
+        return pl.scan_parquet(s3_path, hive_partitioning=True, storage_options=storage_options)
+
+
 def rewrite_sql(
     sql: str,
     storage_options: dict,
+    use_cudf_io: bool = False,
 ) -> tuple[str, pl.SQLContext, str | None, str | None]:
     """Rewrite DuckDB-style SQL for Polars SQLContext execution.
+
+    Args:
+        sql: DuckDB-dialect SQL with read_parquet() inline table functions.
+        storage_options: S3 connection options (endpoint, credentials).
+        use_cudf_io: If True, read parquet via cuDF (GPU decompression +
+            kvikio concurrent S3 transport + explicit DPP) instead of Polars.
 
     Returns:
         (rewritten_sql, sql_context, copy_dest_path, copy_format)
@@ -95,16 +292,25 @@ def rewrite_sql(
             "For cross-resolution joins, pick the coarser shared column."
         )
 
+    # In gpu-cudf mode, extract h0 predicates for DPP before reading any files.
+    # The Polars path gets DPP for free via lazy evaluation; cudf needs it explicit.
+    h0_filter = extract_h0_predicates(sql) if use_cudf_io else None
+    if h0_filter:
+        print(f"  [cudf DPP] extracted {len(h0_filter)} h0 values from SQL", file=sys.stderr)
+
     # Extract and register parquet sources
     path_aliases = extract_parquet_sources(sql)
     ctx = pl.SQLContext()
 
     for s3_path, alias in path_aliases.items():
-        lf = pl.scan_parquet(
-            s3_path,
-            hive_partitioning=True,
-            storage_options=storage_options,
-        )
+        if use_cudf_io:
+            lf = _scan_cudf(s3_path, storage_options, h0_filter=h0_filter)
+        else:
+            lf = pl.scan_parquet(
+                s3_path,
+                hive_partitioning=True,
+                storage_options=storage_options,
+            )
         ctx.register(alias, lf)
 
     # Replace read_parquet('path') with table aliases in SQL

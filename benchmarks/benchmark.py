@@ -62,13 +62,15 @@ JOIN read_parquet('s3://public-iucn/hex/birds_sr/**') b
 JOIN read_parquet('s3://public-iucn/hex/mammals_sr/**') c
   ON a.h8 = c.h8 AND a.h0 = c.h0""",
 
+    # Q3/Q4/Q5: full global carbon (9.9 GiB compressed → ~30 GB uncompressed) — CPU only,
+    # exceeds 20 GB VRAM on RTX 4000 Ada.
     "Q3": """\
 WITH carbon AS (
   SELECT h8, h0, SUM(carbon) AS total_carbon
   FROM read_parquet('s3://public-carbon/irrecoverable-carbon-2024/hex/**')
   GROUP BY h8, h0
 )
-SELECT a.h8, a.total_carbon, b.combined_sr, b.combined_thr_sr
+SELECT a.h8, a.total_carbon, b.combined_sr
 FROM carbon a
 JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
   ON a.h8 = b.h8 AND a.h0 = b.h0""",
@@ -99,6 +101,73 @@ JOIN read_parquet('s3://public-iucn/hex/birds_sr/**') c
 JOIN read_parquet('s3://public-social-vulnerability/svi-2022-tract/hex/h0=*/data_0.parquet') d
   ON a.h8 = d.h8 AND a.h0 = d.h0""",
 
+    # Q3a/Q4a/Q5a: Americas subset (~28 h0 cells, ~2-4 GiB compressed, ~8-12 GB uncompressed).
+    # Fits in 20 GB VRAM — GPU and CPU comparable test.
+    "Q3a": """\
+WITH carbon AS (
+  SELECT h8, h0, SUM(carbon) AS total_carbon
+  FROM read_parquet('s3://public-carbon/irrecoverable-carbon-2024/hex/**')
+  WHERE h0 IN (
+    576531121047601151, 576707042908045311, 576742227280134143, 576812596024311807,
+    576882964768489471, 576953333512667135, 576988517884755967, 577094071001022463,
+    577164439745200127, 577199624117288959, 577234808489377791, 577692205326532607,
+    577727389698621439, 577762574070710271, 578114417791598591, 578149602163687423,
+    578290339652042751, 578395892768309247, 578747736489197567, 578923658349641727,
+    578994027093819391, 579381055186796543, 579451423930974207, 579592161419329535,
+    579627345791418367, 579908820768129023, 580119927000662015, 580401401977372671
+  )
+  GROUP BY h8, h0
+)
+SELECT a.h8, a.total_carbon, b.combined_sr
+FROM carbon a
+JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
+  ON a.h8 = b.h8 AND a.h0 = b.h0""",
+
+    # Q4a: alias carbon h8/h0 to avoid column name collision with WDPA (both have h8/h0).
+    # Polars strict GROUP BY rejects ambiguous column references like b.h8 when both
+    # sides of a join share the same column name.
+    "Q4a": """\
+WITH carbon AS (
+  SELECT h8 AS carbon_h8, h0 AS carbon_h0, SUM(carbon) AS total_carbon
+  FROM read_parquet('s3://public-carbon/irrecoverable-carbon-2024/hex/**')
+  WHERE h0 IN (
+    576531121047601151, 576707042908045311, 576742227280134143, 576812596024311807,
+    576882964768489471, 576953333512667135, 576988517884755967, 577094071001022463,
+    577164439745200127, 577199624117288959, 577234808489377791, 577692205326532607,
+    577727389698621439, 577762574070710271, 578114417791598591, 578149602163687423,
+    578290339652042751, 578395892768309247, 578747736489197567, 578923658349641727,
+    578994027093819391, 579381055186796543, 579451423930974207, 579592161419329535,
+    579627345791418367, 579908820768129023, 580119927000662015, 580401401977372671
+  )
+  GROUP BY h8, h0
+)
+SELECT b.carbon_h8 AS h8, b.total_carbon, COUNT(DISTINCT a.SITE_ID) AS n_protected_areas
+FROM read_parquet('s3://public-wdpa/hex/**') a
+JOIN carbon b ON a.h8 = b.carbon_h8 AND a.h0 = b.carbon_h0
+GROUP BY b.carbon_h8, b.total_carbon""",
+
+    "Q5a": """\
+WITH carbon AS (
+  SELECT h8, h0, SUM(carbon) AS total_carbon
+  FROM read_parquet('s3://public-carbon/irrecoverable-carbon-2024/hex/**')
+  WHERE h0 IN (
+    576531121047601151, 576707042908045311, 576742227280134143, 576812596024311807,
+    576882964768489471, 576953333512667135, 576988517884755967, 577094071001022463,
+    577164439745200127, 577199624117288959, 577234808489377791, 577692205326532607,
+    577727389698621439, 577762574070710271, 578114417791598591, 578149602163687423,
+    578290339652042751, 578395892768309247, 578747736489197567, 578923658349641727,
+    578994027093819391, 579381055186796543, 579451423930974207, 579592161419329535,
+    579627345791418367, 579908820768129023, 580119927000662015, 580401401977372671
+  )
+  GROUP BY h8, h0
+)
+SELECT a.h8, a.total_carbon, b.combined_sr, c.birds_sr
+FROM carbon a
+JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
+  ON a.h8 = b.h8 AND a.h0 = b.h0
+JOIN read_parquet('s3://public-iucn/hex/birds_sr/**') c
+  ON a.h8 = c.h8 AND a.h0 = c.h0""",
+
     "Q6": """\
 SELECT a.h8, COUNT(*) AS gbif_obs, b.combined_sr
 FROM read_parquet('s3://public-gbif/2025-06/hex/**') a
@@ -106,11 +175,20 @@ JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
   ON a.h8 = b.h8 AND a.h0 = b.h0
 GROUP BY a.h8, b.combined_sr""",
 
+    # Q7: taxonomy h0 is stored as hex string (e.g. '8001FFFFFFFFFFF') instead of INT64.
+    # Blocked on data-workflows issue #49. Pre-cast in a CTE so Polars gets a plain
+    # equi-join (Polars forbids CAST in ON clause). DuckDB still errors until the
+    # taxonomy parquet is reprocessed with integer h0.
     "Q7": """\
-SELECT a.h0, SUM(a.n) AS gbif_count, AVG(b.combined_sr) AS mean_richness
-FROM read_parquet('s3://public-gbif/taxonomy/**') a
+WITH tax AS (
+  SELECT CAST(h0 AS BIGINT) AS h0, SUM(n) AS n
+  FROM read_parquet('s3://public-gbif/taxonomy/**')
+  GROUP BY h0
+)
+SELECT a.h0, a.n AS gbif_count, AVG(b.combined_sr) AS mean_richness
+FROM tax a
 JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b ON a.h0 = b.h0
-GROUP BY a.h0""",
+GROUP BY a.h0, a.n""",
 }
 
 # Row-count queries — COUNT(*) wrapper for correctness checking (run once, not timed)
@@ -124,6 +202,7 @@ COUNT_QUERIES = {
 # ---------------------------------------------------------------------------
 
 _SEPARATOR_RE = re.compile(r"^\|[\s|:+-]+\|$")
+_COUNT_RE = re.compile(r"\|\s*(\d[\d,]*)\s*\|")
 
 
 def parse_row_count(text: str) -> int | None:
@@ -137,6 +216,22 @@ def parse_row_count(text: str) -> int | None:
     return max(0, len(lines) - 1)  # subtract header row
 
 
+def parse_count_result(text: str) -> int | None:
+    """Extract integer from a COUNT(*) result (handles Polars repeating rows)."""
+    if not text or text.startswith("SQL Error") or text.startswith("Error"):
+        return None
+    # Find the first numeric value in a data row (skip header)
+    data_lines = [
+        l for l in text.strip().splitlines()
+        if l.strip().startswith("|") and not _SEPARATOR_RE.match(l.strip())
+    ]
+    for line in data_lines[1:]:  # skip header
+        m = _COUNT_RE.search(line)
+        if m:
+            return int(m.group(1).replace(",", ""))
+    return None
+
+
 def is_sql_error(text: str) -> str | None:
     """Return error message if result text is an SQL error, else None."""
     if text.startswith("SQL Error") or text.startswith("Error:"):
@@ -144,10 +239,15 @@ def is_sql_error(text: str) -> str | None:
     return None
 
 
-async def call_tool(session: ClientSession, sql: str) -> tuple[str, float]:
+async def call_tool(
+    session: ClientSession, sql: str, timeout_s: float = 600.0
+) -> tuple[str, float]:
     """Call the query tool; return (result_text, elapsed_seconds)."""
     start = time.perf_counter()
-    result = await session.call_tool("query", {"sql_query": sql})
+    result = await asyncio.wait_for(
+        session.call_tool("query", {"sql_query": sql}),
+        timeout=timeout_s,
+    )
     elapsed = time.perf_counter() - start
     text = ""
     if result.content:
@@ -166,6 +266,7 @@ async def benchmark_server(
     query_ids: list[str],
     n_runs: int,
     results: list[dict],
+    query_timeout: float = 600.0,
 ) -> None:
     print(f"\n{'='*64}")
     print(f"  Server: {name}  —  {url}")
@@ -183,26 +284,23 @@ async def benchmark_server(
             for qid in query_ids:
                 sql = QUERIES[qid]
 
-                # Run COUNT(*) once for row count (untimed)
+                # Run COUNT(*) once for row count (untimed), with a short timeout.
+                # Skip for large-dataset queries (Q3+) where COUNT can take minutes.
+                SKIP_COUNT = {"Q3", "Q4", "Q5", "Q3a", "Q4a", "Q5a", "Q6", "Q7"}
                 row_count = None
-                try:
-                    text, _ = await call_tool(session, COUNT_QUERIES[qid])
-                    err = is_sql_error(text)
-                    if not err:
-                        rc = parse_row_count(text)
-                        if rc == 1:
-                            # COUNT result is one row with a single number
-                            m = re.search(r"\|\s*([\d,]+)\s*\|", text.split("\n")[-1])
-                            if m:
-                                row_count = int(m.group(1).replace(",", ""))
-                except Exception:
-                    pass
+                if qid not in SKIP_COUNT:
+                    try:
+                        text, _ = await call_tool(session, COUNT_QUERIES[qid], timeout_s=120.0)
+                        if not is_sql_error(text):
+                            row_count = parse_count_result(text)
+                    except Exception:
+                        pass
 
                 for run in range(1, n_runs + 1):
                     elapsed = None
                     error = None
                     try:
-                        text, elapsed = await call_tool(session, sql)
+                        text, elapsed = await call_tool(session, sql, timeout_s=query_timeout)
                         error = is_sql_error(text)
                     except Exception as exc:
                         error = str(exc)[:300]
@@ -289,6 +387,10 @@ async def main() -> None:
         "--output", default="benchmarks/results.csv",
         help="CSV output path (default: benchmarks/results.csv)",
     )
+    parser.add_argument(
+        "--timeout", type=float, default=600.0,
+        help="Per-query timeout in seconds (default: 600)",
+    )
     args = parser.parse_args()
 
     query_ids = [q.strip() for q in args.queries.split(",") if q.strip() in QUERIES]
@@ -307,7 +409,8 @@ async def main() -> None:
 
     results: list[dict] = []
     for name in server_names:
-        await benchmark_server(name, SERVERS[name], query_ids, args.runs, results)
+        await benchmark_server(name, SERVERS[name], query_ids, args.runs, results,
+                               query_timeout=args.timeout)
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

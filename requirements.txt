@@ -7,3 +7,4 @@ tabulate
 h3
 s3fs
 duckdb
+kvikio

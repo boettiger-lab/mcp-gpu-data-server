@@ -59,7 +59,7 @@ WITH carbon AS (
   FROM read_parquet('s3://public-carbon/irrecoverable-carbon-2024/hex/**')
   GROUP BY h8, h0
 )
-SELECT a.h8, a.total_carbon, b.combined_sr, b.combined_thr_sr
+SELECT a.h8, a.total_carbon, b.combined_sr
 FROM carbon a
 JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b ON a.h8 = b.h8 AND a.h0 = b.h0
 ```
@@ -113,10 +113,11 @@ GROUP BY a.h8, b.combined_sr
 
 ### Q7 — Coarse resolution join (h0 cross-scale)
 ```sql
-SELECT a.h0, SUM(a.n) AS gbif_count, AVG(b.combined_sr) AS mean_richness
+SELECT CAST(a.h0 AS BIGINT) AS h0, SUM(a.n) AS gbif_count, AVG(b.combined_sr) AS mean_richness
 FROM read_parquet('s3://public-gbif/taxonomy/**') a
-JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b ON a.h0 = b.h0
-GROUP BY a.h0
+JOIN read_parquet('s3://public-iucn/hex/combined_sr/**') b
+  ON CAST(a.h0 AS BIGINT) = b.h0
+GROUP BY CAST(a.h0 AS BIGINT)
 ```
 Joins at H3 resolution 0 (coarse). h0-only join so single key is correct here; no h8 to include.
 
@@ -168,6 +169,55 @@ requires knowing the h0 value up front. For global/multi-partition queries, use 
 - **Correctness parity**: results must be identical (modulo float rounding) between servers.
 
 ---
+
+---
+
+### Q3a / Q4a / Q5a — Americas subset (~2–4 GiB compressed, GPU-feasible)
+
+Same queries as Q3/Q4/Q5 but with a `WHERE h0 IN (...)` filter on the carbon CTE that
+restricts to 28 h0 cells covering the Americas (identified from the Overture regions dataset).
+
+Estimated compressed size: 28/122 × 9.9 GiB ≈ 2.3 GiB, but tropical cells are
+above-average density, so expect 3–5 GiB compressed → ~10–15 GB uncompressed.
+Fits in RTX 4000 Ada 20 GB VRAM with reasonable margin.
+
+Americas h0 values used:
+```
+576531121047601151, 576707042908045311, 576742227280134143, 576812596024311807,
+576882964768489471, 576953333512667135, 576988517884755967, 577094071001022463,
+577164439745200127, 577199624117288959, 577234808489377791, 577692205326532607,
+577727389698621439, 577762574070710271, 578114417791598591, 578149602163687423,
+578290339652042751, 578395892768309247, 578747736489197567, 578923658349641727,
+578994027093819391, 579381055186796543, 579451423930974207, 579592161419329535,
+579627345791418367, 579908820768129023, 580119927000662015, 580401401977372671
+```
+
+Q5a drops the social-vulnerability join (US-only dataset) from Q5 to keep it Americas-wide.
+
+---
+
+## GPU VRAM Constraint
+
+The NRP GPU node uses an **NVIDIA RTX 4000 Ada (20 GB VRAM)**. Polars cuDF GPU engine
+fully materialises each source table in VRAM; it does not stream or spill to CPU.
+
+| Query | Approx in-memory size | GPU feasible? |
+|---|---|---|
+| Q1 (IUCN × IUCN) | ~0.5 GiB | ✓ |
+| Q2 (3-way IUCN) | ~0.7 GiB | ✓ |
+| Q3 (carbon 9.9 GiB × IUCN) | ~30 GiB uncompressed | ✗ OOM |
+| Q4 (WDPA × carbon) | ~30 GiB | ✗ OOM |
+| Q5 (4-way + carbon) | ~30 GiB | ✗ OOM |
+| Q3a (Americas carbon × IUCN) | ~10–15 GiB | ✓ (borderline) |
+| Q4a (Americas carbon × WDPA) | ~10–15 GiB | ✓ (borderline) |
+| Q5a (Americas carbon × 2 IUCN) | ~10–15 GiB | ✓ (borderline) |
+| Q6 (GBIF 119 GiB × IUCN) | >100 GiB | ✗ OOM |
+| Q7 (taxonomy tiny × IUCN) | <0.1 GiB | ✓ |
+
+Q3-Q6 are benchmarked CPU-only. A node with ≥40 GB VRAM (e.g. A100 80GB or
+H100 80GB) would be needed for GPU to compete on the large-dataset queries.
+The KvikIO/cuDF branch adds GPU-accelerated decompression which would still
+benefit Q3-Q5 on a larger GPU.
 
 ## Known Issue: duckdb-geo STAC Catalog Empty
 

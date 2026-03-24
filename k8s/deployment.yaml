@@ -4,6 +4,8 @@ metadata:
   name: gpu-mcp
 spec:
   replicas: 1
+  strategy:
+    type: Recreate   # GPU nodes have 1 GPU; rolling update deadlocks
   selector:
     matchLabels:
       app: gpu-mcp
@@ -21,16 +23,23 @@ spec:
         kubernetes.io/hostname: stratus1.nrp-espm.berkeley.edu
       containers:
       - name: server
-        image: ghcr.io/boettiger-lab/mcp-gpu-data-server:latest
+        image: ghcr.io/boettiger-lab/mcp-gpu-data-server:kvikio-gpu-direct
         env:
         - name: STAC_CATALOG_URL
           value: "https://s3-west.nrp-nautilus.io/public-data/stac/catalog.json"
         - name: QUERY_ENGINE
-          value: "gpu"
+          value: "gpu-cudf"
+        # kvikio thread pool — set_num_threads() Python API is broken in 25.02;
+        # env vars are the only reliable way to configure at library init time.
+        # 64 threads + 16 MiB chunks achieves ~6 Gbps on NRP 100G IB for large files.
+        - name: KVIKIO_NTHREADS
+          value: "64"
+        - name: KVIKIO_TASK_SIZE
+          value: "16777216"
         resources:
           requests:
             memory: 32Gi
-            cpu: 4
+            cpu: 1
             nvidia.com/gpu: 1
           limits:
             memory: 120Gi
