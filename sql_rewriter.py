@@ -135,17 +135,14 @@ def _s3fs_from_storage_options(storage_options: dict):
     import s3fs
     anon = storage_options.get("skip_signature") == "true"
     endpoint = storage_options.get("endpoint_url", "")
+    # config_kwargs={"allow_http": True} is rejected by current botocore versions;
+    # the http:// endpoint_url is sufficient for plain-HTTP Ceph S3.
     if anon:
-        return s3fs.S3FileSystem(
-            anon=True,
-            endpoint_url=endpoint,
-            config_kwargs={"allow_http": True},
-        )
+        return s3fs.S3FileSystem(anon=True, endpoint_url=endpoint)
     return s3fs.S3FileSystem(
         key=storage_options.get("aws_access_key_id"),
         secret=storage_options.get("aws_secret_access_key"),
         endpoint_url=endpoint,
-        config_kwargs={"allow_http": True},
     )
 
 
