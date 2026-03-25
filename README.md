@@ -11,11 +11,12 @@ The design decisions in this server are non-obvious. Each adds real complexity a
 On NRP Nautilus (RTX 4000 Ada, 100G InfiniBand, Ceph S3 internal endpoint), initial benchmarks showed **CPU (DuckDB) 2–4× faster than GPU (Polars/cuDF)** for S3-backed H3 join queries. The bottleneck is not compute — it's the data path:
 
 ```
-GPU path:  S3 → S3 transport → CPU RAM → PCIe → GPU VRAM → cuDF compute
-CPU path:  S3 → S3 transport → CPU RAM → DuckDB compute
+gpu mode:      S3 → Polars Rust object_store → CPU RAM → GPU SQL (GPUEngine)
+gpu-cudf mode: S3 → kvikio pread (6 Gbps) → CPU RAM → Polars parse → GPU SQL (GPUEngine)
+cpu mode:      S3 → Polars Rust object_store → CPU RAM → CPU SQL
 ```
 
-The extra PCIe hop (CPU RAM → GPU VRAM) costs ~40–50s for a 3 GiB query. GPU compute savings are smaller than this overhead unless the S3 download itself is fast enough to make PCIe transfer the dominant term.
+The bottleneck for large datasets is S3 download speed, not compute. kvikio's parallel chunked HTTP achieves 6.25 Gbps vs 0.97 Gbps from Polars Rust object_store — a 6.5× improvement for files > 5 MB.
 
 ### Why kvikio (and why pread, not read)
 
@@ -78,11 +79,11 @@ Without DPP, Q3 (global carbon, no filter) OOMKills the pod. With it, Q3a (Ameri
 
 Set via `QUERY_ENGINE` environment variable:
 
-| Mode | S3 transport | Partition pruning | When to use |
-|---|---|---|---|
-| `gpu` (default) | Polars Rust object_store | Automatic (lazy optimizer) | General use; reliable |
-| `gpu-cudf` | kvikio pread (6 Gbps) | Explicit DPP | Large files (carbon, GBIF) |
-| `cpu` | Polars Rust object_store | Automatic | No GPU available |
+| Mode | S3 transport | Parquet parse | GPU compute | When to use |
+|---|---|---|---|---|
+| `gpu` (default) | Polars Rust object_store | CPU (lazy) | Yes (GPUEngine) | General use; reliable |
+| `gpu-cudf` | kvikio pread (6 Gbps) | CPU (Polars) | Yes (GPUEngine) | Large files (carbon, GBIF) |
+| `cpu` | Polars Rust object_store | CPU (lazy) | No | No GPU available |
 
 `gpu-cudf` is deployed on NRP (`k8s/deployment.yaml`) with `KVIKIO_NTHREADS=64` and `KVIKIO_TASK_SIZE=16777216`.
 

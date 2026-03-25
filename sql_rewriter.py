@@ -14,8 +14,8 @@ Two I/O backends are supported, selected by the `use_cudf_io` flag:
     Partition pruning: automatic via Polars lazy query optimizer (DPP).
     S3 transport: Rust object_store (~10.8s for 548 files, 0.06 GiB).
 
-  cuDF (gpu-cudf mode) — recommended for large-file datasets
-    Path: S3 → kvikio pread (parallel chunked HTTP) → CPU RAM → GPU decompress → VRAM
+  gpu-cudf mode — recommended for large-file datasets (carbon, GBIF)
+    Path: S3 → kvikio pread (parallel chunked HTTP) → CPU RAM → Polars parse → GPU compute
     Partition pruning: explicit h0 predicate extraction before read (issue #4).
     S3 transport: kvikio.RemoteFile.pread() with KVIKIO_NTHREADS=64 env var.
     S3 transport benchmark (carbon Americas, 28 files, 3.22 GiB, internal Ceph):
@@ -23,8 +23,10 @@ Two I/O backends are supported, selected by the `use_cudf_io` flag:
       Polars Rust object_store:                26.6s  0.97 Gbps
     NOTE: kvikio.defaults.set_num_threads() is broken in 25.02 — values don't
     stick. Must use KVIKIO_NTHREADS env var set before library init. See #3.
-    NOTE: cudf.read_parquet(storage_options=...) uses PyArrow S3, NOT kvikio.
-    We use kvikio.RemoteFile.pread() → BytesIO → cudf.read_parquet() instead.
+    NOTE: cudf.read_parquet(BytesIO) loads entire table into GPU VRAM eagerly.
+    For carbon (885M rows), this exceeds 20 GB VRAM → cudaErrorMemoryAllocation.
+    We use kvikio.RemoteFile.pread() → BytesIO → pl.read_parquet() instead:
+    fast S3 download, CPU parquet parse, then GPU SQL execution via GPUEngine().
 """
 
 import concurrent.futures
@@ -170,7 +172,10 @@ def _scan_cudf(
     storage_options: dict,
     h0_filter: frozenset[int] | None = None,
 ) -> pl.LazyFrame:
-    """Read parquet into GPU memory via kvikio pread + cuDF with DPP.
+    """Fast S3 download via kvikio pread + Polars CPU parse + lazy LazyFrame.
+
+    Pipeline: kvikio pread (parallel chunked HTTP, ~6 Gbps) → BytesIO →
+    pl.read_parquet() (CPU, avoids GPU OOM) → pl.concat().lazy().
 
     S3 transport: kvikio.RemoteFile.pread() with parallel chunked HTTP range
     requests. Requires KVIKIO_NTHREADS=64 env var (set_num_threads() is broken
@@ -180,11 +185,14 @@ def _scan_cudf(
     DPP: h0_filter prunes hive partitions before reading, preventing OOM on
     large datasets like global carbon (94 files, 7.3 GiB). See issue #4.
 
+    Parquet parsing uses pl.read_parquet (NOT cudf.read_parquet): cuDF would
+    materialise all rows in GPU VRAM eagerly; for carbon (885M rows) this
+    exceeds 20 GB and crashes. Polars keeps data in CPU RAM as a LazyFrame;
+    GPU compute (collect(engine=GPUEngine())) runs only on the filtered result.
+
     Falls back to Polars Rust reader on any failure.
     """
     try:
-        import cudf
-
         endpoint = storage_options.get("endpoint_url", "")
 
         # Use s3fs for glob resolution only (single API call to list files).
@@ -252,16 +260,21 @@ def _scan_cudf(
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
             results = list(pool.map(_kvikio_download_one, zip(files_http, h0_per_file)))
 
-        # --- cuDF parse each downloaded buffer + inject hive partition columns ---
+        # --- Parse each downloaded buffer via Polars (CPU) + inject hive partition columns ---
+        # NOTE: We intentionally use pl.read_parquet(BytesIO) here, NOT cudf.read_parquet.
+        # cudf.read_parquet materialises the entire table in GPU VRAM before any filtering;
+        # for carbon (885M rows, 28 × 115 MB files) this exceeds the RTX 4000 Ada's 20 GB
+        # VRAM and crashes with cudaErrorMemoryAllocation. Polars reads into CPU RAM, keeps
+        # the table as a LazyFrame, and lets the GPU SQL executor (collect(engine=GPUEngine()))
+        # push predicates down before transferring only the filtered result to VRAM.
         dfs = []
         for raw_bytes, h0_val in results:
-            df_part = cudf.read_parquet(io.BytesIO(raw_bytes))
+            df_part = pl.read_parquet(io.BytesIO(raw_bytes))
             if "h0" not in df_part.columns:
-                df_part["h0"] = h0_val
+                df_part = df_part.with_columns(pl.lit(h0_val).alias("h0"))
             dfs.append(df_part)
 
-        df_cudf = cudf.concat(dfs, ignore_index=True)
-        return pl.from_arrow(df_cudf.to_arrow()).lazy()
+        return pl.concat(dfs, how="diagonal_relaxed").lazy()
 
     except Exception as e:
         print(
