@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: gpu-mcp
 spec:
-  replicas: 1
+  replicas: 0
   strategy:
     type: Recreate   # GPU nodes have 1 GPU; rolling update deadlocks
   selector:
@@ -28,10 +28,14 @@ spec:
         - name: STAC_CATALOG_URL
           value: "https://s3-west.nrp-nautilus.io/public-data/stac/catalog.json"
         - name: QUERY_ENGINE
-          value: "gpu-cudf"
-        # kvikio thread pool — set_num_threads() Python API is broken in 25.02;
-        # env vars are the only reliable way to configure at library init time.
-        # 64 threads + 16 MiB chunks achieves ~6 Gbps on NRP 100G IB for large files.
+          value: "gpu"
+        # Polars thread pool — controls parallel S3 downloads across files.
+        # Default is os.cpu_count() capped at 16; on a 128-CPU node this
+        # leaves most bandwidth unused. 256 threads achieves ~3.8 Gbps vs
+        # 0.62 Gbps at 16 threads on NRP 100G IB (61 files, 4.1 GiB test).
+        - name: POLARS_MAX_THREADS
+          value: "256"
+        # kvikio thread pool (gpu-cudf mode only — not used in gpu mode)
         - name: KVIKIO_NTHREADS
           value: "64"
         - name: KVIKIO_TASK_SIZE
@@ -39,7 +43,7 @@ spec:
         resources:
           requests:
             memory: 32Gi
-            cpu: 1
+            cpu: 8
             nvidia.com/gpu: 1
           limits:
             memory: 120Gi
