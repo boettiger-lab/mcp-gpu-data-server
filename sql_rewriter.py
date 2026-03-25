@@ -217,6 +217,23 @@ def _scan_cudf(
             for f in files_s3
         ]
 
+        # Route small-file datasets through Polars (kvikio's per-connection overhead
+        # dominates for files < ~5 MB, making it 2-3x slower than Polars Rust).
+        # Only use kvikio for large files where parallel chunked pread helps.
+        # Threshold chosen from benchmarks: IUCN (0.1 MB avg) → Polars faster;
+        # carbon (78 MB avg) → kvikio 6.5x faster.
+        file_sizes = [fs.info(f.removeprefix("s3://"))["size"] for f in files_s3]
+        avg_size = sum(file_sizes) / len(file_sizes) if file_sizes else 0
+        KVIKIO_MIN_AVG_SIZE = 5 * 1024 * 1024  # 5 MB — below this use Polars
+
+        if avg_size < KVIKIO_MIN_AVG_SIZE:
+            print(
+                f"  [cudf] {s3_path.split('/')[-2]}: avg {avg_size/1e6:.1f} MB < 5 MB threshold, "
+                f"using Polars reader",
+                file=sys.stderr,
+            )
+            return pl.scan_parquet(files_s3, hive_partitioning=True, storage_options=storage_options)
+
         # Extract h0 value from each file path for hive partition column injection
         h0_per_file = [
             int(m.group(1)) if (m := _H0_PATH_RE.search(f)) else 0
@@ -227,6 +244,11 @@ def _scan_cudf(
         # n_workers = min(len(files_http), 64) — one Python thread per file,
         # each thread uses kvikio's internal thread pool for chunked range requests.
         n_workers = min(len(files_http), 64)
+        print(
+            f"  [kvikio] {s3_path.split('/')[-2]}: {len(files_http)} files, "
+            f"avg {avg_size/1e6:.0f} MB, {n_workers} workers",
+            file=sys.stderr,
+        )
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
             results = list(pool.map(_kvikio_download_one, zip(files_http, h0_per_file)))
 
