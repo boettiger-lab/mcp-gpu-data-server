@@ -23,7 +23,7 @@ spec:
         kubernetes.io/hostname: stratus1.nrp-espm.berkeley.edu
       containers:
       - name: server
-        image: ghcr.io/boettiger-lab/mcp-gpu-data-server:kvikio-gpu-direct
+        image: ghcr.io/boettiger-lab/mcp-gpu-data-server:main
         env:
         - name: STAC_CATALOG_URL
           value: "https://s3-west.nrp-nautilus.io/public-data/stac/catalog.json"
