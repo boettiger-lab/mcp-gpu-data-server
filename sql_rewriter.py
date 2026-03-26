@@ -237,10 +237,22 @@ def _scan_cudf(
         if avg_size < KVIKIO_MIN_AVG_SIZE:
             print(
                 f"  [cudf] {s3_path.split('/')[-2]}: avg {avg_size/1e6:.1f} MB < 5 MB threshold, "
-                f"using Polars reader",
+                f"using Polars reader (no hive partitioning, for GPUEngine compatibility)",
                 file=sys.stderr,
             )
-            return pl.scan_parquet(files_s3, hive_partitioning=True, storage_options=storage_options)
+            # Read eagerly without hive_partitioning=True so GPUEngine can execute
+            # plans that join this table. pl.scan_parquet(..., hive_partitioning=True)
+            # produces a scan node cudf-polars cannot handle (pola-rs/polars#20577),
+            # silently falling back to CPU. Instead read each file and inject h0 from
+            # the path — same pattern as the kvikio large-file path above.
+            dfs = []
+            for f in files_s3:
+                df = pl.read_parquet(f, storage_options=storage_options)
+                m = _H0_PATH_RE.search(f)
+                if m and "h0" not in df.columns:
+                    df = df.with_columns(pl.lit(int(m.group(1))).alias("h0"))
+                dfs.append(df)
+            return pl.concat(dfs, how="diagonal_relaxed").lazy()
 
         # Extract h0 value from each file path for hive partition column injection
         h0_per_file = [
