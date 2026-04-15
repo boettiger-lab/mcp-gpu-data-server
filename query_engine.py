@@ -115,9 +115,10 @@ RESULT_LIMIT = 50
 # ---------------------------------------------------------------------------
 
 def _free_gpu_memory() -> None:
-    """Release RAPIDS memory pool blocks back to the device after each query."""
+    """Release GPU and CPU memory after each query."""
     import gc
     gc.collect()
+    gc.collect()  # two passes to catch reference cycles
     try:
         import cupy
         cupy.get_default_memory_pool().free_all_blocks()
@@ -210,6 +211,7 @@ def execute(sql_query: str) -> str:
 
         result_lf = ctx.execute(rewritten_sql)
 
+        limited_lf = None
         if copy_dest:
             df = _collect(result_lf, use_gpu=True)
             result = _handle_copy(df, copy_dest, copy_format)
@@ -218,7 +220,10 @@ def execute(sql_query: str) -> str:
             df = _collect(limited_lf, use_gpu=True)
             result = _format_markdown(df)
 
-        del df
+        # Explicitly release all query-scoped objects before GC so that
+        # registered DataFrames in ctx and lazy intermediates are freed
+        # promptly between runs rather than accumulating until GC decides.
+        del df, limited_lf, result_lf, ctx
         _free_gpu_memory()
         return result
 
