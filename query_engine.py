@@ -93,11 +93,16 @@ _ENGINE_MODE = os.environ.get("QUERY_ENGINE", "gpu").lower()
 PREFER_GPU = _ENGINE_MODE != "cpu"
 USE_CUDF_IO = _ENGINE_MODE == "gpu-cudf" and _GPU_AVAILABLE
 
+# ALLOW_CPU_FALLBACK: when "true" (default), GPU failures fall back to CPU
+# with a warning. Set to "false" for benchmarking to surface GPU errors.
+ALLOW_CPU_FALLBACK = os.environ.get("ALLOW_CPU_FALLBACK", "true").lower() != "false"
+
 print(
     f"Query engine: {_ENGINE_MODE}  "
     f"(GPU compute: {PREFER_GPU and _GPU_AVAILABLE}, "
     f"cuDF I/O: {USE_CUDF_IO}, "
-    f"kvikio: {_KVIKIO_AVAILABLE})",
+    f"kvikio: {_KVIKIO_AVAILABLE}, "
+    f"cpu_fallback: {ALLOW_CPU_FALLBACK})",
     file=sys.stderr,
 )
 
@@ -109,13 +114,33 @@ RESULT_LIMIT = 50
 # Collect / execute
 # ---------------------------------------------------------------------------
 
+def _free_gpu_memory() -> None:
+    """Release RAPIDS memory pool blocks back to the device after each query."""
+    import gc
+    gc.collect()
+    try:
+        import cupy
+        cupy.get_default_memory_pool().free_all_blocks()
+        cupy.get_default_pinned_memory_pool().free_all_blocks()
+    except ImportError:
+        pass
+
+
 def _collect(lf: pl.LazyFrame, use_gpu: bool = True) -> pl.DataFrame:
-    """Collect a LazyFrame, with GPU→CPU fallback."""
+    """Collect a LazyFrame, using GPU when available.
+
+    If ALLOW_CPU_FALLBACK=true (default), GPU failures fall back to CPU with
+    a warning. If ALLOW_CPU_FALLBACK=false (benchmark mode), raises on GPU fail.
+    """
     if use_gpu and PREFER_GPU and _GPU_AVAILABLE:
-        try:
+        if ALLOW_CPU_FALLBACK:
+            try:
+                return lf.collect(engine=GPUEngine())
+            except Exception as e:
+                print(f"GPU execution failed, falling back to CPU: {e}", file=sys.stderr)
+                return lf.collect()
+        else:
             return lf.collect(engine=GPUEngine())
-        except Exception as e:
-            print(f"GPU execution failed, falling back to CPU: {e}", file=sys.stderr)
     return lf.collect()
 
 
@@ -187,11 +212,16 @@ def execute(sql_query: str) -> str:
 
         if copy_dest:
             df = _collect(result_lf, use_gpu=True)
-            return _handle_copy(df, copy_dest, copy_format)
+            result = _handle_copy(df, copy_dest, copy_format)
         else:
             limited_lf = result_lf.head(RESULT_LIMIT)
             df = _collect(limited_lf, use_gpu=True)
-            return _format_markdown(df)
+            result = _format_markdown(df)
+
+        del df
+        _free_gpu_memory()
+        return result
 
     except Exception as e:
+        _free_gpu_memory()
         return f"SQL Error: {str(e)}"
