@@ -1,0 +1,38 @@
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: mcp-long-timeout
+  namespace: mcp
+spec:
+  forwardingTimeouts:
+    dialTimeout: 30s
+    responseHeaderTimeout: 600s
+    idleConnTimeout: 600s
+    readIdleTimeout: 600s
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcp-server-gpu-ingress
+  namespace: mcp
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-production
+    external-dns.alpha.kubernetes.io/cloudflare-proxied: "false"
+    traefik.ingress.kubernetes.io/service.servertransport: mcp-mcp-long-timeout@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: gpu-mcp.carlboettiger.info
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: mcp-server-gpu
+            port:
+              number: 8000
+  tls:
+  - hosts:
+    - gpu-mcp.carlboettiger.info
+    secretName: mcp-server-gpu-tls

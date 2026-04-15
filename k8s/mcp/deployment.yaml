@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-mcp
+  namespace: mcp
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # GPU nodes have limited GPUs; rolling update deadlocks
+  selector:
+    matchLabels:
+      app: gpu-mcp
+  template:
+    metadata:
+      labels:
+        app: gpu-mcp
+    spec:
+      runtimeClassName: nvidia
+      nodeSelector:
+        kubernetes.io/hostname: cirrus   # 2x Quadro RTX 8000 (49 GB each)
+      imagePullSecrets:
+      - name: ghcr-pull-secret
+      containers:
+      - name: server
+        image: ghcr.io/boettiger-lab/mcp-gpu-data-server:main
+        imagePullPolicy: Always
+        env:
+        - name: STAC_CATALOG_URL
+          value: "http://minio-svc.minio.svc.cluster.local:9000/public-data/stac/catalog.json"
+        - name: S3_ENDPOINT_URL
+          value: "http://minio-svc.minio.svc.cluster.local:9000"
+        - name: QUERY_ENGINE
+          value: "gpu-cudf"
+        - name: POLARS_MAX_THREADS
+          value: "64"
+        - name: KVIKIO_NTHREADS
+          value: "64"
+        - name: KVIKIO_TASK_SIZE
+          value: "16777216"
+        resources:
+          requests:
+            memory: 16Gi
+            cpu: 8
+            nvidia.com/gpu: 14
+          limits:
+            memory: 128Gi
+            cpu: 16
+            nvidia.com/gpu: 14
+        ports:
+        - containerPort: 8000
+          name: http
+        readinessProbe:
+          tcpSocket:
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 5

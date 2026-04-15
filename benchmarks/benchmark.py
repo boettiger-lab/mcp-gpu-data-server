@@ -18,6 +18,7 @@ Usage:
 import argparse
 import asyncio
 import csv
+import os
 import re
 import statistics
 import time
@@ -31,7 +32,7 @@ from mcp.client.streamable_http import streamablehttp_client
 # ---------------------------------------------------------------------------
 
 SERVERS = {
-    "gpu": "https://gpu-mcp.nrp-nautilus.io/mcp",
+    "gpu": "https://gpu-mcp.carlboettiger.info/mcp",
     "cpu": "https://duckdb-mcp.nrp-nautilus.io/mcp",
 }
 
@@ -411,7 +412,15 @@ async def main() -> None:
         "--timeout", type=float, default=600.0,
         help="Per-query timeout in seconds (default: 600)",
     )
+    parser.add_argument(
+        "--gpu-url",
+        default=os.environ.get("GPU_MCP_URL", SERVERS["gpu"]),
+        help="Override GPU server URL (default: value of GPU_MCP_URL env var or built-in URL)",
+    )
     args = parser.parse_args()
+
+    # Apply URL override
+    SERVERS["gpu"] = args.gpu_url
 
     query_ids = [q.strip() for q in args.queries.split(",") if q.strip() in QUERIES]
     server_names = [s.strip() for s in args.servers.split(",") if s.strip() in SERVERS]
