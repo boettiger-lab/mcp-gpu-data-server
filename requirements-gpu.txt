@@ -1,0 +1,4 @@
+polars
+h3
+s3fs
+# kvikio installed via conda in Dockerfile (pinned cuda12/py312 build)

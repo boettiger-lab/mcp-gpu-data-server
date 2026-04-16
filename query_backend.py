@@ -166,13 +166,17 @@ def _handle_copy(df: pl.DataFrame, dest_path: str, format_opts: str | None) -> s
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def execute(sql_query: str) -> str:
+def execute(sql_query: str, s3_key: str = None, s3_secret: str = None, s3_endpoint: str = None, s3_scope: str = None) -> str:
     """Execute a SQL query using Polars with optional GPU acceleration.
 
     I/O backend is controlled by QUERY_ENGINE env var:
       gpu       — Polars lazy reader (default)
       gpu-cudf  — cuDF eager reader with kvikio RDMA when available
       cpu       — CPU-only
+
+    Per-request credentials (s3_key, s3_secret, s3_endpoint, s3_scope) are accepted for
+    interface compatibility but ignored — configure via AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+    / S3_ENDPOINT_URL environment variables instead.
 
     Returns a markdown-formatted result table or error message.
     """
