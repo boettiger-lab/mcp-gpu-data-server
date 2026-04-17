@@ -45,7 +45,6 @@ def load_text_file(filename):
     print(f"Warning: Could not find {filename}", file=sys.stderr)
     return ""
 
-GUIDE_RAW = load_text_file("datasets.md")
 OPTIM_RAW = load_text_file("query-optimization.md")
 H3_RAW = load_text_file("h3-guide.md")
 ROLE_RAW = load_text_file("assistant-role.md")
@@ -58,11 +57,8 @@ TOOL_INJECTED_CONTEXT = f"""
 ### CRITICAL SQL RULES (MUST FOLLOW)
 1. **NO TABLES EXIST:** The database is empty. You CANNOT write `FROM table_name`.
 2. **USE PARQUET PATHS:** You MUST use `FROM read_parquet('s3://...')` for ALL queries.
-3. **DISCOVER PATHS:** Use `list_datasets` and `get_dataset` tools to find S3 paths and column schemas.
+3. **DISCOVER PATHS:** Call `list_datasets` then `get_dataset` to get exact S3 paths and schemas — NEVER guess or hardcode paths.
 4. **NO H3 FUNCTIONS:** Do NOT use `h3_cell_to_parent()` or `h3_h3_to_string()`. Use pre-computed H3 columns (h0-h11) directly. For cross-resolution joins, use the coarser shared column.
-
-### SQL DATA GUIDE
-{GUIDE_RAW}
 
 ### OPTIMIZATION RULES
 {OPTIM_RAW}
@@ -114,14 +110,29 @@ def analyst_persona() -> str:
 # -------------------------------------------------------------------------
 # 7. TOOL DEFINITION — SQL Query
 # -------------------------------------------------------------------------
-def query(sql_query: str) -> str:
+def query(sql_query: str, s3_key: str = None, s3_secret: str = None,
+          s3_endpoint: str = None, s3_scope: str = None) -> str:
     """Placeholder (overwritten below)."""
     print(f"Executing: {sql_query}", file=sys.stderr)
-    return query_engine.execute(sql_query)
+    storage_options = None
+    if s3_key and s3_secret:
+        endpoint = s3_endpoint or "s3-west.nrp-nautilus.io"
+        storage_options = {
+            "aws_access_key_id": s3_key,
+            "aws_secret_access_key": s3_secret,
+            "endpoint_url": f"http://{endpoint}" if endpoint.startswith("rook") else f"https://{endpoint}",
+        }
+        if s3_scope:
+            storage_options["scope"] = s3_scope
+    return query_engine.execute(sql_query, storage_options=storage_options)
 
 query.__doc__ = f"""
 Executes GPU-accelerated SQL via Polars (cuDF backend).
 STRICTLY FOLLOW THE RULES BELOW.
+
+For private data, pass s3_key, s3_secret, and optionally s3_endpoint and s3_scope alongside the SQL query.
+Use s3_scope (e.g. 's3://private-data') when the query mixes private and public S3 paths.
+Credentials are scoped to this request only and never persisted.
 
 {TOOL_INJECTED_CONTEXT}
 """

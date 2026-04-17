@@ -192,7 +192,7 @@ def _handle_copy(df: pl.DataFrame, dest_path: str, format_opts: str | None) -> s
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def execute(sql_query: str) -> str:
+def execute(sql_query: str, storage_options: dict = None) -> str:
     """Execute a SQL query using Polars with optional GPU acceleration.
 
     I/O backend is controlled by QUERY_ENGINE env var:
@@ -200,12 +200,16 @@ def execute(sql_query: str) -> str:
       gpu-cudf  — cuDF eager reader with kvikio RDMA when available
       cpu       — CPU-only
 
+    storage_options: optional per-request override; merged on top of the
+    server-default S3_STORAGE_OPTIONS. Destroyed after the request completes.
+
     Returns a markdown-formatted result table or error message.
     """
+    opts = {**S3_STORAGE_OPTIONS, **(storage_options or {})}
     try:
         rewritten_sql, ctx, copy_dest, copy_format = rewrite_sql(
             sql_query,
-            S3_STORAGE_OPTIONS,
+            opts,
             use_cudf_io=USE_CUDF_IO,
         )
 
